@@ -21,12 +21,13 @@ Enruta cada evento segun su topico:
                    volts/rpm/enabled/setpoint/owner, tal cual los publica
                    el bus.
     "mode"      -> control_eventos (evento discreto: cambio de modo entre
-                   manual/qlearning/sarsa_lambda/reinforce/free, quien lo
-                   pidio y cuando). Se ignora el valor "retenido" que el
+                   manual/pid/qlearning/sarsa_lambda/reinforce/free, quien
+                   lo pidio y cuando). Se ignora el valor "retenido" que el
                    bus entrega automaticamente al suscribirse -- ese no es
                    un cambio real, es solo el estado que ya habia.
-    cualquier otro -> se ignora (control, enable, setpoint, agent/table,
-                      agent/status, log: no se persisten por ahora).
+    cualquier otro -> se ignora (control, enable, setpoint, config, link,
+                      agent/table, agent/status, log: no se persisten por
+                      ahora).
 
 Uso:
     python3 mongo_motor_subscriber.py \
@@ -64,8 +65,12 @@ from bus_client import BusClient
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("mongo_motor_subscriber")
 
-# Debe coincidir con los "owner" validos de motor_bus.py / rl_motor_*.py.
-MODOS_VALIDOS = {"manual", "qlearning", "sarsa_lambda", "reinforce", "free"}
+# Debe coincidir con los "owner" validos de motor_bus.py / los controladores
+# (ctl_pid.py toma el mando como owner="pid"; los tres de RL usan su propia
+# clave: qlearning/sarsa_lambda/reinforce). Faltaba "pid" en esta lista: sin
+# el, un cambio a modo PID se descartaba con un warning en vez de guardarse
+# en control_eventos.
+MODOS_VALIDOS = {"manual", "pid", "qlearning", "sarsa_lambda", "reinforce", "free"}
 
 
 def _parse_timestamp(t_pc: Any) -> datetime:
@@ -119,7 +124,7 @@ def procesar_evento(msg: Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]
         }
         return "control_eventos", doc
 
-    return None  # control/enable/setpoint/agent/*/log: no se persisten aun
+    return None  # control/enable/setpoint/config/link/agent/*/log: no se persisten aun
 
 
 class MongoBatchWriter:

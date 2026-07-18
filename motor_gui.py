@@ -189,7 +189,10 @@ class MotorGUI:
         self.host, self.port = bus.host, bus.port
         self.eventos = queue.Queue()
         self.cola_proc = queue.Queue()
-        self.hist = deque(maxlen=int(VENTANA_S * 60))
+        # Historial acotado por TIEMPO en _on_tel (con tope duro de seguridad).
+        # El maxlen fijo de antes (VENTANA_S*60) asumia 60 Hz: con Ts=10 ms
+        # (100 Hz) la ventana de 30 s se quedaba en 18 s reales.
+        self.hist = deque(maxlen=12000)
         self.tabla = None
         self.status = {}
         self.owner = "manual"
@@ -207,6 +210,14 @@ class MotorGUI:
         self.widgets_param = []
         self.procesos = {}          # clave -> Proceso
         self.consolas = {}          # clave -> dict(frame, text, entry)
+        # --- caches de dibujo (dibujo INCREMENTAL, ver _pintar_tabla/_strip) ---
+        self._strips = {}           # canvas -> items reutilizables de la grafica
+        self._tab_cache = None      # rectangulos del mapa de calor ya creados
+        self._leg_firma = None      # que leyenda esta dibujada (evita repintarla)
+        self._leg_lbls = None       # ids de las etiquetas vmin/vmax de la leyenda
+        self._disc_cache = None     # Discretizer cacheado para la celda actual
+        self._tel_nueva = True      # hay telemetria sin dibujar
+        self._tabla_nueva = False   # hay tabla sin dibujar (coalescing por tick)
         # --- estado de conexion (bus TCP y enlace serie del Arduino) ---
         self.conectado = True
         self.link_ok = True
@@ -772,7 +783,7 @@ class MotorGUI:
                 self._on_tel(data)
             elif topico == "agent/table":
                 self.tabla = data
-                self._pintar_tabla()
+                self._tabla_nueva = True   # se pinta UNA vez al final del tick
             elif topico == "agent/status":
                 self.status = data
             elif topico == "mode":
@@ -802,6 +813,11 @@ class MotorGUI:
                                "fin")
                 self._log(f"[gui] '{clave}' termino (codigo {dato})")
 
+        if self._tabla_nueva:
+            self._tabla_nueva = False
+            self._pintar_tabla()
+        elif self.tabla:
+            self._marcar_celda_actual()    # el borde blanco sigue al estado
         self._pintar_graficas()
         self._pintar_panel()
         self.root.after(REFRESCO_MS, self._tick)   # la GUI NUNCA deja de latir
@@ -843,6 +859,10 @@ class MotorGUI:
         self.enabled = bool(m.get("enabled"))
         self.owner = m.get("owner", self.owner)
         self.hist.append((m["t_pc"] - self.t0, m["rpm"], sp, m["pwm"]))
+        t = self.hist[-1][0]
+        while self.hist and t - self.hist[0][0] > VENTANA_S + 1.0:
+            self.hist.popleft()            # recorte por tiempo (ver __init__)
+        self._tel_nueva = True
         if sp > 0:
             self.banda.append(1 if abs(err) <= 40 else 0)
             self.err2.append(err * err)
@@ -889,101 +909,167 @@ class MotorGUI:
 
     # ---- graficas ------------------------------------------------------------
     def _pintar_graficas(self):
+        """Antes: delete("all") y ~2000 items nuevos 12 veces/segundo aunque no
+        hubiera datos nuevos. Ahora la rejilla/titulos se crean UNA vez (y solo
+        se rehacen al cambiar de tamanno), las curvas son items fijos a los que
+        se les mueven los puntos con coords(), y si no llego telemetria nueva
+        no se toca nada."""
+        nueva = self._tel_nueva
+        self._tel_nueva = False
         self._strip(self.c_rpm, ("rpm medido", "consigna"), 0, self.rpm_fs,
-                    [(1, VERDE), (2, ACENTO)], "Senal medida: velocidad (rpm)")
+                    [(1, VERDE), (2, ACENTO)], "Senal medida: velocidad (rpm)",
+                    nueva)
         self._strip(self.c_pwm, ("pwm",), 0, 255, [(3, AMBAR)],
-                    "Senal de control: PWM (0-255)")
+                    "Senal de control: PWM (0-255)", nueva)
 
-    def _strip(self, c, nombres, ymin, ymax, series, titulo):
-        c.delete("all")
+    def _strip(self, c, nombres, ymin, ymax, series, titulo, nueva):
         w = c.winfo_width() or 600
         h = c.winfo_height() or 200
+        cache = self._strips.get(c)
+        if cache and cache["firma"] == (w, h) and not nueva:
+            return                       # nada que hacer: ni datos ni resize
         ml, mr, mt, mb = 52, 10, 22, 20
         x0, y0, x1, y1 = ml, mt, w - mr, h - mb
         if x1 <= x0 or y1 <= y0:
             return
-        c.create_text(ml, 10, text=titulo, fill=SUAVE, anchor="w",
-                      font=("TkDefaultFont", 9))
-        for i in range(5):
-            y = y0 + (y1 - y0) * i / 4
-            c.create_line(x0, y, x1, y, fill=REJILLA)
-            c.create_text(ml - 6, y, text=f"{ymax - (ymax-ymin)*i/4:.0f}",
-                          fill=SUAVE, anchor="e", font=("TkFixedFont", 8))
-        if not self.hist:
-            return
-        t_fin = self.hist[-1][0]
-        t_ini = t_fin - VENTANA_S
-        datos = [d for d in self.hist if d[0] >= t_ini]
+        if not cache or cache["firma"] != (w, h):
+            # ---- capa ESTATICA: solo al crear o al redimensionar ----
+            c.delete("all")
+            c.create_text(ml, 10, text=titulo, fill=SUAVE, anchor="w",
+                          font=("TkDefaultFont", 9))
+            for i in range(5):
+                y = y0 + (y1 - y0) * i / 4
+                c.create_line(x0, y, x1, y, fill=REJILLA)
+                c.create_text(ml - 6, y, text=f"{ymax - (ymax-ymin)*i/4:.0f}",
+                              fill=SUAVE, anchor="e", font=("TkFixedFont", 8))
+            c.create_text(x0, y1 + 10, text=f"-{VENTANA_S:.0f}s", fill=SUAVE,
+                          anchor="w", font=("TkFixedFont", 8))
+            c.create_text(x1, y1 + 10, text="ahora", fill=SUAVE, anchor="e",
+                          font=("TkFixedFont", 8))
+            for i, n in enumerate(nombres):
+                c.create_text(x1 - 8, mt + 4 + i * 13, text=n, anchor="e",
+                              fill=series[i][1], font=("TkFixedFont", 8))
+            lineas = [c.create_line(0, 0, 0, 0, fill=color, width=2,
+                                    state="hidden") for _, color in series]
+            cache = {"firma": (w, h), "lineas": lineas}
+            self._strips[c] = cache
+
+        datos = self.hist                # ya viene recortado por tiempo
+        lineas = cache["lineas"]
         if len(datos) < 2:
+            for lid in lineas:
+                c.itemconfigure(lid, state="hidden")
             return
-
-        def px(t):
-            return x0 + (t - t_ini) / VENTANA_S * (x1 - x0)
-
-        def py(v):
-            v = max(ymin, min(ymax, v))
-            return y1 - (v - ymin) / (ymax - ymin) * (y1 - y0)
-
-        for idx, color in series:
+        t_fin = datos[-1][0]
+        t_ini = t_fin - VENTANA_S
+        # Submuestreo: no tiene sentido dibujar mas puntos que pixeles. Con
+        # Ts=10 ms son 3000 muestras en 30 s para ~600 px de ancho.
+        paso = max(1, len(datos) // max(1, int(x1 - x0)))
+        sx = (x1 - x0) / VENTANA_S
+        sy = (y1 - y0) / (ymax - ymin)
+        for (idx, _), lid in zip(series, lineas):
             pts = []
+            k = 0
             for d in datos:
-                pts.extend((px(d[0]), py(d[idx])))
+                td = d[0]
+                if td < t_ini:
+                    continue
+                if k % paso == 0:
+                    v = d[idx]
+                    if v < ymin:
+                        v = ymin
+                    elif v > ymax:
+                        v = ymax
+                    pts.append(x0 + (td - t_ini) * sx)
+                    pts.append(y1 - (v - ymin) * sy)
+                k += 1
             if len(pts) >= 4:
-                c.create_line(*pts, fill=color, width=2)
-        for i, n in enumerate(nombres):
-            c.create_text(x1 - 8, mt + 4 + i * 13, text=n, anchor="e",
-                          fill=series[i][1], font=("TkFixedFont", 8))
-        c.create_text(x0, y1 + 10, text=f"-{VENTANA_S:.0f}s", fill=SUAVE,
-                      anchor="w", font=("TkFixedFont", 8))
-        c.create_text(x1, y1 + 10, text="ahora", fill=SUAVE, anchor="e",
-                      font=("TkFixedFont", 8))
+                c.coords(lid, *pts)      # mover la curva, no recrearla
+                c.itemconfigure(lid, state="normal")
+            else:
+                c.itemconfigure(lid, state="hidden")
 
     # ---- mapa de calor -------------------------------------------------------
     def _pintar_tabla(self):
+        """Mapa de calor INCREMENTAL. Antes cada actualizacion del agente (4/s)
+        y cada resize destruia y recreaba ~500 rectangulos + textos + ejes.
+        Ahora los items se crean UNA vez (o al cambiar tamanno/rejilla) y las
+        actualizaciones solo cambian el color con itemconfigure: el coste por
+        refresco cae un orden de magnitud y la GUI no parpadea."""
         c = self.c_tab
-        c.delete("all")
         t = self.tabla
         w = c.winfo_width() or 420
         h = c.winfo_height() or 300
         if not t:
+            c.delete("all")
+            self._tab_cache = None
             msg = "sin datos:\nlanza un controlador de RL"
             if self.status.get("kind") == "none":
-                msg = f"{self.status.get('algo','')} no tiene tabla\n(controlador clasico)"
+                msg = (f"{self.status.get('algo','')} no tiene tabla"
+                       f"\n(controlador clasico)")
             c.create_text(w / 2, h / 2, text=msg, fill=SUAVE, justify="center")
             self.c_leg.delete("all")
+            self._leg_firma = None
             return
         nx, ny = t["err_bins"], t["derr_bins"]
         acciones = t["acciones"]
-        ml, mt, mr, mb = 44, 14, 8, 28
-        cw = max(4, (w - ml - mr) / nx)
-        ch = max(4, (h - mt - mb) / ny)
+        firma = (nx, ny, w, h, tuple(acciones))
+        cache = self._tab_cache
+        if cache is None or cache["firma"] != firma:
+            cache = self._crear_tabla_items(t, nx, ny, w, h, firma)
+            self._tab_cache = cache
+
+        # ---- actualizacion: SOLO colores y textos ----
         vals = [v for fila in t["value"] for v in fila if v is not None]
         vmin, vmax = (min(vals), max(vals)) if vals else (0.0, 1.0)
         rango = (vmax - vmin) or 1.0
         por_accion = self.vista.get() == "accion"
-
+        rects, textos = cache["rects"], cache["textos"]
+        n_acc = len(acciones)
+        n_vis = 0
+        cfg = c.itemconfigure
         for db in range(ny):
+            fv, fa, fr = t["value"][db], t["action"][db], rects[db]
+            ft = textos[db] if textos else None
             for eb in range(nx):
-                v = t["value"][db][eb]
-                a = t["action"][db][eb]
-                x = ml + eb * cw
-                y = mt + (ny - 1 - db) * ch
+                v, a = fv[eb], fa[eb]
                 if v is None or a is None:
                     col = "#232838"
-                elif por_accion:
-                    col = color_accion(a, len(acciones))
                 else:
-                    col = color_valor((v - vmin) / rango)
-                c.create_rectangle(x, y, x + cw, y + ch, fill=col, outline="")
-                if cw >= 26 and ch >= 18 and a is not None:
-                    c.create_text(x + cw / 2, y + ch / 2, text=str(acciones[a]),
-                                  fill="#e8ecf5", font=("TkFixedFont", 7))
-        cel = self._celda_actual(t)
-        if cel:
-            eb, db = cel
-            c.create_rectangle(ml + eb * cw, mt + (ny - 1 - db) * ch,
-                               ml + (eb + 1) * cw, mt + (ny - db) * ch,
-                               outline="#ffffff", width=2)
+                    n_vis += 1
+                    col = (color_accion(a, n_acc) if por_accion
+                           else color_valor((v - vmin) / rango))
+                cfg(fr[eb], fill=col)
+                if ft:
+                    cfg(ft[eb], text="" if a is None else str(acciones[a]))
+        self._marcar_celda_actual()
+        self.lb_tabla.config(text=f"{t['algo']} ({t['kind']})  celdas "
+                                  f"{n_vis}/{nx*ny}   valor {vmin:+.2f}..{vmax:+.2f}")
+        self._pintar_leyenda(acciones, vmin, vmax, por_accion)
+
+    def _crear_tabla_items(self, t, nx, ny, w, h, firma):
+        """Crea (una sola vez) rectangulos, textos, ejes y la marca del estado."""
+        c = self.c_tab
+        c.delete("all")
+        ml, mt, mr, mb = 44, 14, 8, 28
+        cw = max(4, (w - ml - mr) / nx)
+        ch = max(4, (h - mt - mb) / ny)
+        con_txt = cw >= 26 and ch >= 18
+        rects, textos = [], ([] if con_txt else None)
+        for db in range(ny):
+            y = mt + (ny - 1 - db) * ch
+            fr, ft = [], []
+            for eb in range(nx):
+                x = ml + eb * cw
+                fr.append(c.create_rectangle(x, y, x + cw, y + ch,
+                                             fill="#232838", outline=""))
+                if con_txt:
+                    ft.append(c.create_text(x + cw / 2, y + ch / 2, text="",
+                                            fill="#e8ecf5",
+                                            font=("TkFixedFont", 7)))
+            rects.append(fr)
+            if con_txt:
+                textos.append(ft)
         ee, de = t["err_edges"], t["derr_edges"]
         c.create_text(ml + (w - ml - mr) / 2, h - 6,
                       text="error de velocidad (consigna - medida) [rpm]",
@@ -998,50 +1084,84 @@ class MotorGUI:
                           anchor="e", font=("TkFixedFont", 7))
         c.create_text(10, mt + ny * ch / 2, text="d(error)", fill=SUAVE,
                       angle=90, font=("TkFixedFont", 8))
-        n_vis = sum(1 for fila in t["value"] for v in fila if v is not None)
-        self.lb_tabla.config(text=f"{t['algo']} ({t['kind']})  celdas "
-                                  f"{n_vis}/{nx*ny}   valor {vmin:+.2f}..{vmax:+.2f}")
-        self._pintar_leyenda(acciones, vmin, vmax, por_accion)
+        marca = c.create_rectangle(0, 0, 0, 0, outline="#ffffff", width=2,
+                                   state="hidden")
+        return {"firma": firma, "rects": rects, "textos": textos,
+                "marca": marca, "geom": (ml, mt, cw, ch, nx, ny)}
+
+    def _marcar_celda_actual(self):
+        """Mueve el borde blanco del estado actual SIN repintar el mapa: asi la
+        marca sigue a la telemetria en cada tick, no solo cuando el agente
+        publica su tabla (antes iba a saltos)."""
+        cache, t = self._tab_cache, self.tabla
+        if not cache or not t:
+            return
+        cel = self._celda_actual(t)
+        c = self.c_tab
+        if not cel:
+            c.itemconfigure(cache["marca"], state="hidden")
+            return
+        ml, mt, cw, ch, nx, ny = cache["geom"]
+        eb, db = cel
+        c.coords(cache["marca"], ml + eb * cw, mt + (ny - 1 - db) * ch,
+                 ml + (eb + 1) * cw, mt + (ny - db) * ch)
+        c.itemconfigure(cache["marca"], state="normal")
+        c.tag_raise(cache["marca"])
 
     def _celda_actual(self, t):
         try:
-            from rl_motor_common import Discretizer
-            d = Discretizer(err_bins=t["err_bins"], derr_bins=t["derr_bins"])
-            return d.key({"err": self.err_actual, "derr": self.derr_actual})
+            bins = (t["err_bins"], t["derr_bins"])
+            if self._disc_cache is None or self._disc_cache[0] != bins:
+                from rl_motor_common import Discretizer
+                self._disc_cache = (bins, Discretizer(err_bins=bins[0],
+                                                      derr_bins=bins[1]))
+            return self._disc_cache[1].key({"err": self.err_actual,
+                                            "derr": self.derr_actual})
         except Exception:
             return None
 
     def _pintar_leyenda(self, acciones, vmin, vmax, por_accion):
+        """La leyenda solo se redibuja al cambiar de modo o de tamanno; en modo
+        'valor' las etiquetas vmin/vmax se actualizan con itemconfigure (antes
+        se redibujaba el degradado entero, ~400 lineas, en cada refresco)."""
         c = self.c_leg
-        c.delete("all")
         w = c.winfo_width() or 420
-        if por_accion:
-            c.create_text(4, 8, text="accion: incremento de PWM por decision",
-                          fill=SUAVE, anchor="w", font=("TkFixedFont", 8))
-            n = len(acciones)
-            bw = (w - 16) / n
-            for i, a in enumerate(acciones):
-                x = 8 + i * bw
-                c.create_rectangle(x, 20, x + bw - 2, 38, fill=color_accion(i, n),
-                                   outline="")
-                c.create_text(x + bw / 2, 29, text=f"{a:+d}", fill="#e8ecf5",
-                              font=("TkFixedFont", 8))
-            c.create_text(8, 47, text="frenar", fill=SUAVE, anchor="w",
-                          font=("TkFixedFont", 7))
-            c.create_text(w - 8, 47, text="acelerar", fill=SUAVE, anchor="e",
-                          font=("TkFixedFont", 7))
-        else:
-            c.create_text(4, 8, text="valor del estado (max_a Q)", fill=SUAVE,
-                          anchor="w", font=("TkFixedFont", 8))
-            for i in range(max(1, w - 16)):
-                c.create_line(8 + i, 20, 8 + i, 38,
-                              fill=color_valor(i / max(1, w - 17)))
-            c.create_text(8, 47, text=f"{vmin:+.2f}", fill=SUAVE, anchor="w",
-                          font=("TkFixedFont", 7))
-            c.create_text(w - 8, 47, text=f"{vmax:+.2f}", fill=SUAVE, anchor="e",
-                          font=("TkFixedFont", 7))
-        c.create_text(w - 8, 8, text="borde blanco = estado actual", fill=SUAVE,
-                      anchor="e", font=("TkFixedFont", 7))
+        firma = (por_accion, w, tuple(acciones))
+        if firma != self._leg_firma:
+            self._leg_firma = firma
+            self._leg_lbls = None
+            c.delete("all")
+            if por_accion:
+                c.create_text(4, 8, text="accion: incremento de PWM por decision",
+                              fill=SUAVE, anchor="w", font=("TkFixedFont", 8))
+                n = len(acciones)
+                bw = (w - 16) / n
+                for i, a in enumerate(acciones):
+                    x = 8 + i * bw
+                    c.create_rectangle(x, 20, x + bw - 2, 38,
+                                       fill=color_accion(i, n), outline="")
+                    c.create_text(x + bw / 2, 29, text=f"{a:+d}", fill="#e8ecf5",
+                                  font=("TkFixedFont", 8))
+                c.create_text(8, 47, text="frenar", fill=SUAVE, anchor="w",
+                              font=("TkFixedFont", 7))
+                c.create_text(w - 8, 47, text="acelerar", fill=SUAVE, anchor="e",
+                              font=("TkFixedFont", 7))
+            else:
+                c.create_text(4, 8, text="valor del estado (max_a Q)", fill=SUAVE,
+                              anchor="w", font=("TkFixedFont", 8))
+                for i in range(max(1, w - 16)):
+                    c.create_line(8 + i, 20, 8 + i, 38,
+                                  fill=color_valor(i / max(1, w - 17)))
+                lb_min = c.create_text(8, 47, text="", fill=SUAVE, anchor="w",
+                                       font=("TkFixedFont", 7))
+                lb_max = c.create_text(w - 8, 47, text="", fill=SUAVE, anchor="e",
+                                       font=("TkFixedFont", 7))
+                self._leg_lbls = (lb_min, lb_max)
+            c.create_text(w - 8, 8, text="borde blanco = estado actual",
+                          fill=SUAVE, anchor="e", font=("TkFixedFont", 7))
+        if not por_accion and self._leg_lbls:
+            c.itemconfigure(self._leg_lbls[0], text=f"{vmin:+.2f}")
+            c.itemconfigure(self._leg_lbls[1], text=f"{vmax:+.2f}")
 
 
 def main():

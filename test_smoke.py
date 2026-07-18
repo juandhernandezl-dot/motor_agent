@@ -97,6 +97,7 @@ def main():
     assert bot.detectar_comando_modo("cambia el modo a qlearning") == "qlearning"
     assert bot.detectar_comando_modo("pon el modo sarsa porfa") == "sarsa_lambda"
     assert bot.detectar_comando_modo("cambia a modo manual") == "manual"
+    assert bot.detectar_comando_modo("cambia a modo pid") == "pid"
     assert bot.detectar_comando_modo("cambia a reinforce") == "reinforce"
     assert bot.detectar_comando_modo("déjalo en modo free") == "free"
     assert bot.detectar_comando_modo("¿cómo va el rpm?") is None
@@ -155,6 +156,14 @@ def main():
     assert resultado is not None
     coleccion, doc = resultado
     assert coleccion == "control_eventos" and doc["modo"] == "manual"
+
+    resultado = sub.procesar_evento({
+        "type": "event", "topic": "mode", "seq": 3,
+        "data": {"owner": "pid", "src": "telegram:1"},
+    })
+    assert resultado is not None
+    coleccion, doc = resultado
+    assert coleccion == "control_eventos" and doc["modo"] == "pid"
 
     # El valor "retenido" que el bus entrega al suscribirse NO es un cambio
     # real de modo; no debe guardarse.

@@ -25,8 +25,10 @@ Arquitectura real del bus (ver motor_bus.py):
   Este bot es un cliente mas: publica {"cmd":"publish","topic":"mode",
   "data":{"owner":...}} cuando alguien pide cambiar de modo.
 
-Los "owner" validos del bus son: manual, qlearning, sarsa_lambda,
-reinforce, free.
+Los "owner" validos del bus son: manual, pid, qlearning, sarsa_lambda,
+reinforce, free (el motivo por el que se agrego "pid": ctl_pid.py toma el
+mando con owner="pid", tal como los tres algoritmos de RL usan su propia
+clave; faltaba en esta lista y el bot no podia cambiar a ese modo).
 
 Principios de Karpathy:
 - Think Before Coding: si piden "modo" sin decir cual de los 5, el bot NO
@@ -58,6 +60,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Deque, Dict, Optional
 
+from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 from openai import OpenAI
 from piper import PiperVoice
@@ -73,6 +76,14 @@ from telegram.ext import (
 )
 
 from bus_client import BusClient
+
+# Carga el .env directamente (busca en el directorio actual y en los padres).
+# Antes había que hacer `export $(grep -v '^#' .env | xargs)` a mano en cada
+# terminal nueva; si se te olvidaba tras editar el .env, el bot arrancaba
+# con variables viejas o vacías (eso fue lo que pasó con PIPER_VOICE_PATH:
+# el bot corrió sin la variable, no porque el código de síntesis fallara).
+# Por default no pisa variables ya exportadas a mano en esa terminal.
+load_dotenv()
 
 # --------------------------------------------------------------------------
 # Configuración (todo por variables de entorno; ver .env.example)
@@ -111,10 +122,11 @@ MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "motor_telemetria")
 TELEMETRY_STALE_SECONDS = int(os.environ.get("TELEMETRY_STALE_SECONDS", "10"))
 
 # Debe coincidir con los "owner" válidos de motor_bus.py / rl_motor_*.py.
-MODOS_VALIDOS = ("manual", "qlearning", "sarsa_lambda", "reinforce", "free")
+MODOS_VALIDOS = ("manual", "pid", "qlearning", "sarsa_lambda", "reinforce", "free")
 # Sinónimos en español para detectar el comando sin ambigüedad artificial.
 _SINONIMOS_MODO = {
     "manual": ("manual",),
+    "pid": ("pid",),
     "qlearning": ("qlearning", "q-learning", "q learning"),
     "sarsa_lambda": ("sarsa",),
     "reinforce": ("reinforce",),
@@ -129,7 +141,7 @@ SYSTEM_PROMPT = (
     "el dashboard. No inventes valores que no te den; si falta un dato, dilo. "
     "Recibirás el estado ACTUAL del motor (rpm medido, pwm aplicado, "
     "voltaje del tacómetro, setpoint) y el modo de control vigente (uno de "
-    "manual, qlearning, sarsa_lambda, reinforce o free). Para cambiar el "
+    "manual, pid, qlearning, sarsa_lambda, reinforce o free). Para cambiar el "
     "modo de control el usuario debe pedirlo explícitamente y decir cuál "
     "('cambia a modo qlearning'); eso NO lo decides tú ni lo simulas en la "
     "respuesta, ya lo maneja el sistema por fuera de ti."
@@ -253,11 +265,16 @@ def ask_llm(chat_id: int, user_text: str) -> str:
     """
     status_context = format_status_for_llm()
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": f"Estado actual: {status_context}"},
-    ]
+    # El estado va DESPUES del historial, justo antes de la pregunta nueva
+    # (no al principio): con un modelo chico como Qwen3.5-4B, lo que esta
+    # mas cerca de la pregunta pesa mas que un system message de varios
+    # turnos atras. Si el estado quedara arriba, una respuesta vieja del
+    # historial (ej. "no tengo datos", de un turno anterior sin Mongo)
+    # queda mas cerca de la pregunta que el dato fresco, y el modelo repite
+    # la negativa vieja en vez de leer el estado actual.
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(_history[chat_id])
+    messages.append({"role": "system", "content": f"Estado actual: {status_context}"})
     messages.append({"role": "user", "content": user_text})
 
     response = llm_client.chat.completions.create(
@@ -334,7 +351,7 @@ async def procesar_mensaje_texto(chat_id: int, user_text: str) -> str:
     modo_pedido = detectar_comando_modo(user_text)
 
     if modo_pedido == "ambiguo":
-        return "¿A cuál modo? Puedo cambiar a: manual, qlearning, sarsa_lambda, reinforce o free."
+        return "¿A cuál modo? Puedo cambiar a: manual, pid, qlearning, sarsa_lambda, reinforce o free."
 
     if modo_pedido is not None:
         try:
@@ -409,7 +426,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "¡Hola! Soy el agente del motor DC (QET). Pregúntame por el estado "
         "(rpm, pwm, setpoint) o pídeme cambiar el modo de control, por "
         "ejemplo: 'cambia el modo a qlearning' (también: manual, "
-        "sarsa_lambda, reinforce, free). Puedes escribirme o mandarme una "
+        "pid, sarsa_lambda, reinforce, free). Puedes escribirme o mandarme una "
         "nota de voz."
     )
 

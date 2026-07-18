@@ -30,6 +30,13 @@ TOPICOS (todos con "retencion": el ultimo valor se entrega al suscribirse)
   agent/table  <- publicado por los algoritmos: instantanea de su tabla/politica
                   para que la GUI la dibuje (ver rl_motor_common.snapshot()).
   agent/status <- {"algo","phase","episode","epsilon","reward","states",...}
+  config       <- {"ts_ms":N,"src":...} PERIODO DE MUESTREO en caliente: el bus
+                  se lo ordena al Arduino ('T<ms>') o al simulador y lo reemite.
+                  Cambiarlo cambia la dinamica vista por el agente (ver README).
+  link         <- {"ok":bool,"msg":str,"reintentos":N,"t":ts} ESTADO DEL ENLACE
+                  SERIE (no de este bus TCP). Si 'ok' es false, el bus sigue
+                  vivo y atendiendo clientes; solo el Arduino esta desconectado
+                  y se esta reintentando solo cada pocos segundos.
   log          <- mensajes crudos del Arduino (#ok / #err / #info)
 
 PROTOCOLO TCP (una linea JSON por mensaje, UTF-8)
@@ -75,13 +82,15 @@ import time
 
 HOST = "127.0.0.1"
 PORT = 8770
-BAUD = 9600
+BAUD = 115200
 
 # Debe coincidir con RPM_FS_DEFAULT del firmware (rpm a 5 V del tacometro).
 RPM_FS = 3000.0
 
 TOPICS_RETENIDOS = ("telemetry", "control", "enable", "setpoint", "mode",
-                    "agent/table", "agent/status", "log")
+                    "config", "link", "agent/table", "agent/status", "log")
+
+TS_MIN, TS_MAX = 10, 1000      # limites del periodo de muestreo (ms)
 
 
 # =============================================================================
@@ -146,28 +155,103 @@ class BaseLink(threading.Thread):
     def set_enable(self, on):
         raise NotImplementedError
 
+    def set_ts(self, ts_ms):
+        raise NotImplementedError
+
     def stop(self):
         self._stop.set()
 
 
 class SerialLink(BaseLink):
-    """Puente con el Arduino real por USB."""
+    """
+    Puente con el Arduino real por USB.
 
-    def __init__(self, port, baud, ts_ms, rpm_fs, on_sample, on_log):
+    RESILIENTE A CORTES: un cable flojo, el Mega reseteandose o el driver de
+    Windows (CH340/FTDI) fallando con ClearCommError NO deben tumbar el bus
+    entero. Dos medidas concretas:
+
+      1) 'write_timeout' en el puerto: sin esto, un ser.write() puede quedarse
+         COLGADO PARA SIEMPRE si el sistema operativo no puede vaciar el buffer
+         de salida. Como todas las ordenes (PWM, enable, Ts) pasan por el MISMO
+         lock, un solo write colgado bloquea ese lock indefinidamente y deja
+         SORDO A TODO EL BUS, aunque los clientes reconecten (siguen esperando
+         el mismo lock). Con write_timeout, el write falla en <=0.5s en vez de
+         colgarse, se registra el error y el lock se libera.
+      2) RECONEXION AUTOMATICA: al fallar la lectura o la escritura, no se
+         aborta el hilo: se marca el enlace 'caido' y se reintenta abrir el
+         puerto cada RECONEXION_S segundos. Las ordenes que lleguen mientras
+         tanto se descartan silenciosamente (el WATCHDOG del firmware ya pone
+         PWM=0 solo al no recibir nada en 1.5s: es seguro).
+    """
+
+    RECONEXION_S = 2.0
+    WRITE_TIMEOUT = 0.5
+
+    def __init__(self, port, baud, ts_ms, rpm_fs, on_sample, on_log, on_link=None):
         super().__init__(on_sample, on_log)
         import serial  # import perezoso: solo se necesita con hardware
-        self.ser = serial.Serial(port, baud, timeout=0.2)
+        self._serial_mod = serial
+        self.port, self.baud = port, baud
+        self.rpm_fs = rpm_fs
         self.lock = threading.Lock()
         self.ts_ms = ts_ms
-        time.sleep(2.0)          # el Mega se reinicia al abrir el puerto
-        self.ser.reset_input_buffer()
-        self._write(f"T{int(ts_ms)}")
-        self._write(f"K{float(rpm_fs):.1f}")
-        self._write("Z")
+        self.on_link = on_link or (lambda ok, msg: None)
+        self.ser = None
+        self.up = False
+        self.reintentos = 0
+        self._abrir(primera_vez=True)   # si falla aqui, es fatal al arrancar
+
+    # ---- apertura / reconexion -------------------------------------------
+    def _abrir(self, primera_vez=False):
+        serial = self._serial_mod
+        try:
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+            self.ser = serial.Serial(self.port, self.baud, timeout=0.2,
+                                     write_timeout=self.WRITE_TIMEOUT)
+            time.sleep(2.0)          # el Mega se reinicia al abrir el puerto
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+            self._escribir_directo(f"T{int(self.ts_ms)}")
+            self._escribir_directo(f"K{float(self.rpm_fs):.1f}")
+            self._escribir_directo("Z")
+            self.up = True
+            self.reintentos = 0
+            self.on_link(True, "puerto abierto")
+            if not primera_vez:
+                self.on_log(f"#ok puerto {self.port} reabierto")
+            return True
+        except Exception as e:
+            self.up = False
+            if primera_vez:
+                raise
+            self.reintentos += 1
+            self.on_link(False, str(e))
+            return False
+
+    def _escribir_directo(self, txt):
+        """Sin capturar errores: solo la usan la apertura y _write (que si
+        los captura), asi que un fallo aqui siempre se gestiona arriba."""
+        self.ser.write((txt + "\n").encode("ascii"))
 
     def _write(self, txt):
+        """Escritura tolerante a fallos: NUNCA propaga la excepcion. Si el
+        puerto esta caido, descarta la orden (el watchdog del firmware
+        protege igualmente) y deja que run() reconecte."""
         with self.lock:
-            self.ser.write((txt + "\n").encode("ascii"))
+            if not self.up or self.ser is None:
+                return False
+            try:
+                self._escribir_directo(txt)
+                return True
+            except Exception as e:
+                self.up = False
+                self.on_link(False, f"escritura fallida: {e}")
+                self.on_log(f"#err escritura serie: {e}")
+                return False
 
     def set_pwm(self, v):
         self.pwm = int(v)
@@ -177,14 +261,27 @@ class SerialLink(BaseLink):
         self.enabled = bool(on)
         self._write(f"E{1 if on else 0}")
 
+    def set_ts(self, ts_ms):
+        self.ts_ms = int(ts_ms)
+        self._write(f"T{self.ts_ms}")
+
     def run(self):
         seq = 0
         while not self._stop.is_set():
+            if not self.up:
+                if self._abrir():
+                    continue
+                time.sleep(self.RECONEXION_S)
+                continue
             try:
                 raw = self.ser.readline()
             except Exception as e:
-                self.on_log(f"serie caido: {e}")
-                break
+                with self.lock:
+                    self.up = False
+                self.on_link(False, str(e))
+                self.on_log(f"serie caido: {e} (reintentando cada "
+                            f"{self.RECONEXION_S:.0f}s)")
+                continue
             if not raw:
                 continue
             linea = raw.decode("ascii", "replace").strip()
@@ -216,17 +313,23 @@ class SerialLink(BaseLink):
 class SimLink(BaseLink):
     """Motor simulado con la MISMA cadencia y los mismos mensajes."""
 
-    def __init__(self, ts_ms, rpm_fs, on_sample, on_log, plant=None):
+    def __init__(self, ts_ms, rpm_fs, on_sample, on_log, on_link=None, plant=None):
         super().__init__(on_sample, on_log)
         self.ts = ts_ms / 1000.0
         self.rpm_fs = rpm_fs
         self.plant = plant or MotorPlant(rpm_max=rpm_fs)
+        self.reintentos = 0
+        if on_link:
+            on_link(True, "simulado")
 
     def set_pwm(self, v):
         self.pwm = int(max(0, min(255, v)))
 
     def set_enable(self, on):
         self.enabled = bool(on)
+
+    def set_ts(self, ts_ms):
+        self.ts = int(ts_ms) / 1000.0
 
     def run(self):
         self.on_log("#hello motor-rl 1.0 (SIMULADO)")
@@ -384,7 +487,7 @@ class MotorBus:
         self.ts_ms, self.rpm_fs = ts_ms, rpm_fs
         self.rpm_max = rpm_max if rpm_max else rpm_fs * 1.02
         self.keepalive_s = keepalive_s
-        self.link = link_factory(self._on_sample, self._on_log)
+        self.link = link_factory(self._on_sample, self._on_log, self._on_link)
         self.srv = None
         self._stop = threading.Event()
         self.n_muestras = 0
@@ -394,6 +497,8 @@ class MotorBus:
         self.broker.retenido["control"] = {"pwm": 0, "src": "bus"}
         self.broker.retenido["enable"] = {"on": False, "src": "bus"}
         self.broker.retenido["setpoint"] = {"rpm": 0.0, "src": "bus"}
+        self.broker.retenido["config"] = {"ts_ms": ts_ms, "rpm_fs": rpm_fs,
+                                          "rpm_max": self.rpm_max, "src": "bus"}
 
     # ---- planta -> bus -------------------------------------------------------
     def _on_sample(self, s):
@@ -417,6 +522,15 @@ class MotorBus:
 
     def _on_log(self, txt):
         self.broker.publicar("log", {"t": time.time(), "msg": txt})
+
+    def _on_link(self, ok, msg):
+        """Estado del enlace SERIE (no confundir con el bus TCP, que sigue
+        vivo aunque el Arduino se desconecte). OJO: el propio enlace puede
+        invocar esto DURANTE su construccion, antes de que 'self.link' se haya
+        terminado de asignar en __init__; por eso se usa getattr con defecto."""
+        reintentos = getattr(getattr(self, "link", None), "reintentos", 0)
+        self.broker.publicar("link", {"ok": bool(ok), "msg": msg,
+                                      "reintentos": reintentos, "t": time.time()})
 
     # ---- clientes -> planta --------------------------------------------------
     def publicar_desde(self, cliente, topico, data):
@@ -448,6 +562,25 @@ class MotorBus:
             if not on:
                 self.link.set_pwm(0)
 
+        elif topico == "config":
+            ts = data.get("ts_ms")
+            if ts is not None:
+                try:
+                    ts = int(ts)
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "ts_ms invalido"}
+                if not (TS_MIN <= ts <= TS_MAX):
+                    return {"ok": False,
+                            "error": f"ts_ms fuera de {TS_MIN}..{TS_MAX} ms"}
+                self.ts_ms = ts
+                try:
+                    self.link.set_ts(ts)
+                except Exception as e:
+                    return {"ok": False, "error": f"no se pudo aplicar Ts: {e}"}
+                self._on_log(f"#ok Ts = {ts} ms (lo pidio '{src}')")
+            data = {"ts_ms": self.ts_ms, "rpm_fs": self.rpm_fs,
+                    "rpm_max": self.rpm_max, "src": src}
+
         elif topico == "mode":
             owner = str(data.get("owner") or "free")
             # Al cambiar de mando se corta el PWM: transferencia limpia.
@@ -475,6 +608,7 @@ class MotorBus:
                 "sim": isinstance(self.link, SimLink), "muestras": self.n_muestras,
                 "owner": (self.broker.ultimo("mode") or {}).get("owner"),
                 "pwm": ctrl.get("pwm", 0), "interlock": self.interlock,
+                "link_ok": getattr(self.link, "up", True),
                 "clientes": [c.nombre for c in list(self.broker.clientes)],
                 "topics": list(TOPICS_RETENIDOS)}
 
@@ -565,11 +699,12 @@ def main():
         return
 
     if args.sim:
-        def factory(on_s, on_l):
-            return SimLink(args.ts, args.rpm_fs, on_s, on_l)
+        def factory(on_s, on_l, on_link):
+            return SimLink(args.ts, args.rpm_fs, on_s, on_l, on_link)
     else:
-        def factory(on_s, on_l):
-            return SerialLink(args.serial, args.baud, args.ts, args.rpm_fs, on_s, on_l)
+        def factory(on_s, on_l, on_link):
+            return SerialLink(args.serial, args.baud, args.ts, args.rpm_fs,
+                              on_s, on_l, on_link)
 
     try:
         bus = MotorBus(factory, args.host, args.port, args.ts, args.rpm_fs, args.rpm_max)
