@@ -57,9 +57,13 @@ class FakeLMStudioHandler(BaseHTTPRequestHandler):
 
 
 def _fake_bus_server(port: int) -> None:
-    """Bus falso: acepta UNA conexión, responde 'ok' a hello y a publish
-    de 'mode'. Suficiente para probar bot._publicar_modo_sync sin correr
-    motor_bus.py real (que necesita --sim o hardware)."""
+    """Bus falso que simula el ida-y-vuelta real de un cambio de
+    controlador: hello -> subscribe a "controller/ack" (se consume su "ok",
+    ver subscribe_and_ack en bus_client.py) -> publish de
+    "controller/launch" -> y, como haría motor_gui.py al terminar de
+    detener/lanzar, un evento en "controller/ack" confirmando el éxito.
+    Suficiente para probar bot._cambiar_controlador_sync sin correr
+    motor_bus.py ni motor_gui.py reales."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
@@ -67,19 +71,32 @@ def _fake_bus_server(port: int) -> None:
     conn, _ = srv.accept()
     with conn:
         buf = b""
-        while b"\n" not in buf:
-            buf += conn.recv(4096)
-        linea, buf = buf.split(b"\n", 1)
-        m = json.loads(linea.decode("utf-8"))
+
+        def _leer_mensaje():
+            nonlocal buf
+            while b"\n" not in buf:
+                buf += conn.recv(4096)
+            linea, buf = buf.split(b"\n", 1)
+            return json.loads(linea.decode("utf-8"))
+
+        m = _leer_mensaje()
         assert m.get("cmd") == "hello"
         conn.sendall((json.dumps({"ok": True, "name": m.get("name")}) + "\n").encode("utf-8"))
 
-        while b"\n" not in buf:
-            buf += conn.recv(4096)
-        linea, buf = buf.split(b"\n", 1)
-        m = json.loads(linea.decode("utf-8"))
-        assert m.get("cmd") == "publish" and m.get("topic") == "mode"
-        conn.sendall((json.dumps({"ok": True, "topic": "mode"}) + "\n").encode("utf-8"))
+        m = _leer_mensaje()
+        assert m.get("cmd") == "subscribe" and m.get("topics") == ["controller/ack"]
+        conn.sendall((json.dumps({"ok": True}) + "\n").encode("utf-8"))
+
+        m = _leer_mensaje()
+        assert m.get("cmd") == "publish" and m.get("topic") == "controller/launch"
+        clave = m["data"]["clave"]
+        conn.sendall((json.dumps({"ok": True, "topic": "controller/launch"}) + "\n").encode("utf-8"))
+
+        # Esto es lo que motor_gui.py publicaria de verdad tras detener el
+        # controlador anterior y lanzar el pedido.
+        evento = {"type": "event", "topic": "controller/ack",
+                  "data": {"clave": clave, "ok": True}}
+        conn.sendall((json.dumps(evento) + "\n").encode("utf-8"))
     srv.close()
 
 
@@ -98,6 +115,17 @@ def main():
     assert bot.detectar_comando_modo("pon el modo sarsa porfa") == "sarsa_lambda"
     assert bot.detectar_comando_modo("cambia a modo manual") == "manual"
     assert bot.detectar_comando_modo("cambia a modo pid") == "pid"
+    # Mensaje corto que ES solo el nombre del modo (sin "modo"/"cambia"):
+    # bug real reportado -- sin esto, caía al LLM y "mentía" que ya habia
+    # cambiado. Debe detectarse igual que con las palabras disparadoras.
+    assert bot.detectar_comando_modo("Qlearning") == "qlearning"
+    assert bot.detectar_comando_modo("Sarsa Lambda") == "sarsa_lambda"
+    assert bot.detectar_comando_modo("Manual") == "manual"
+    assert bot.detectar_comando_modo("Free") == "free"
+    assert bot.detectar_comando_modo("Pid") == "pid"
+    # Pero una PREGUNTA mas larga que solo menciona un modo de paso sigue
+    # yendo al LLM como consulta, no como orden de cambio.
+    assert bot.detectar_comando_modo("¿cómo va el pid ahorita?") is None
     assert bot.detectar_comando_modo("cambia a reinforce") == "reinforce"
     assert bot.detectar_comando_modo("déjalo en modo free") == "free"
     assert bot.detectar_comando_modo("¿cómo va el rpm?") is None
@@ -116,8 +144,9 @@ def main():
     print("Respuesta:", reply)
     assert reply
 
-    print("\n--- enviar_comando_modo() contra el bus falso ---")
-    bot._publicar_modo_sync("qlearning", chat_id=1)
+    print("\n--- enviar_comando_modo() contra el bus falso (detener+lanzar) ---")
+    respuesta = bot._cambiar_controlador_sync("qlearning", chat_id=1)
+    assert "control del motor ahora" in respuesta, respuesta
     bus_thread.join(timeout=2)
     print("OK")
 

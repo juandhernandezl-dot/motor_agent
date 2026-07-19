@@ -43,7 +43,7 @@ try:
 except ImportError:
     raise SystemExit("Falta tkinter.  Debian/Ubuntu:  sudo apt install python3-tk")
 
-from motor_client import BusClient
+from motor_client import BusClient, BusError, BusRechazado
 from controller_registry import descubrir, construir_cmd
 
 VENTANA_S = 30.0
@@ -231,6 +231,15 @@ class MotorGUI:
         # un slider no acumula cientos de envios pendientes. ---
         self._bus_lock = threading.Lock()
         self._pub_pendientes = {}
+        # Cola APARTE, en FIFO (sin coalescing), para eventos de una sola vez
+        # que NO deben pisarse entre si -- ej. "controller/ack": si llegan dos
+        # pedidos de cambio de modo casi al mismo tiempo (dos mensajes de
+        # Telegram seguidos), cada uno necesita SU PROPIO ack; coalescing por
+        # topico (como hace _pub_pendientes) perderia el primero si el
+        # segundo lo pisa antes de que el hilo alcance a enviarlo, y ese
+        # pedido se quedaria esperando hasta el timeout del lado del bot
+        # aunque la GUI si lo haya resuelto.
+        self._pub_unicos = deque()
         self._pub_lock = threading.Lock()
         self._pub_evento = threading.Event()
         threading.Thread(target=self._pub_worker, daemon=True).start()
@@ -242,7 +251,8 @@ class MotorGUI:
 
     def _suscribir(self):
         for t in ("telemetry", "agent/table", "agent/status", "mode", "log",
-                  "setpoint", "enable", "config", "link"):
+                  "setpoint", "enable", "config", "link",
+                  "controller/launch", "controller/stop"):
             self.bus.subscribe(t, lambda d, t=t: self.eventos.put((t, d)))
         self.bus.on_close = lambda: self.eventos.put(("__cerrado__", None))
 
@@ -259,14 +269,30 @@ class MotorGUI:
             with self._pub_lock:
                 pendientes = self._pub_pendientes
                 self._pub_pendientes = {}
+                unicos = list(self._pub_unicos)
+                self._pub_unicos.clear()
             for topico, data in pendientes.items():
-                try:
-                    with self._bus_lock:
-                        bus = self.bus
-                    bus.publish(topico, data)
-                except Exception as e:
-                    self.eventos.put(("__pub_error__", f"{topico}: {e}"))
-                    self._quiza_reconectar()
+                self._publicar_uno(topico, data)
+            for topico, data in unicos:
+                self._publicar_uno(topico, data)
+
+    def _publicar_uno(self, topico, data):
+        """Un solo intento de publish, distinguiendo RECHAZO de protocolo
+        (BusRechazado: el bus respondio 'ok:false', ej. arbitraje de
+        'control' cuando quien publica no tiene el mando) de una caida REAL
+        de conexion (BusError pelada / cualquier otra excepcion). Solo la
+        segunda debe disparar reconexion -- un rechazo es una respuesta
+        normal del protocolo, no significa que el bus este caido."""
+        try:
+            with self._bus_lock:
+                bus = self.bus
+            bus.publish(topico, data)
+        except BusRechazado as e:
+            # El bus esta vivo y respondio; solo rechazo el comando.
+            self.eventos.put(("__pub_error__", f"{topico}: {e}"))
+        except Exception as e:
+            self.eventos.put(("__pub_error__", f"{topico}: {e}"))
+            self._quiza_reconectar()
 
     def _quiza_reconectar(self):
         if self._reconectando or self._parar_hilos.is_set():
@@ -601,6 +627,113 @@ class MotorGUI:
         self._escribir(clave, "[gui] Ctrl+C enviado: parando el motor y soltando "
                               "el mando...", "gui")
 
+    # =========================================================================
+    # CONTROL REMOTO (ej. desde bot.py / el agente de Telegram, via el bus)
+    # =========================================================================
+    # Nadie mas que esta GUI toca subprocesos (Popen/Ctrl+C): asi evitamos que
+    # el bot lance su propia copia de qlearning peleando por el mismo
+    # qtable_motor_qlearning.json. El bot solo publica "quiero que el motor
+    # pase a X" en el topico "controller/launch"; esta seccion es la que de
+    # verdad detiene lo que este vivo y lanza lo pedido (o solo cambia el
+    # modo, si X es manual/free, que no tienen script propio).
+    #
+    # Para RL, el default de fabrica de "Modo"/"Ritmo" es "" (menu
+    # interactivo en la consola). Un lanzamiento remoto no tiene a nadie
+    # sentado en esa consola para contestar el menu, asi que aqui se fuerza
+    # "--controlar --directo" (usar la politica ya aprendida, sin
+    # pre-entrenar) en vez de heredar ese default a ciegas.
+    _REMOTO_OVERRIDES = {
+        "qlearning": {"Modo": "--controlar", "Ritmo": "--directo"},
+        "sarsa_lambda": {"Modo": "--controlar", "Ritmo": "--directo"},
+        "reinforce": {"Modo": "--controlar", "Ritmo": "--directo"},
+    }
+
+    def _valores_remotos(self, c):
+        overrides = self._REMOTO_OVERRIDES.get(c.clave, {})
+        return {i: overrides.get(p.get("etiqueta", ""), p.get("default"))
+                for i, p in enumerate(c.params)}
+
+    def _publicar_ack(self, clave, ok, error=None):
+        data = {"clave": clave, "ok": ok}
+        if error:
+            data["error"] = error
+        self._pub_unico("controller/ack", data)
+
+    def _on_remote_launch(self, data):
+        clave = data.get("clave")
+        src = data.get("src", "remoto")
+
+        vivos = [k for k, p in self.procesos.items() if p.vivo()]
+        for k in vivos:
+            self.procesos[k].detener()
+            self._escribir(k, f"[gui] Ctrl+C enviado (pedido remoto de {src}, "
+                              f"cambio a '{clave}').", "gui")
+
+        if clave in ("manual", "free"):
+            self._pub("mode", {"owner": clave})
+            if clave == "manual":
+                # El controlador que se acaba de detener (si habia uno)
+                # publica su propio "enable=False" al morir (ver finally:
+                # de ctl_pid.py / rl_motor_common.py). Si publicaramos
+                # "enable=True" de inmediato, esa desactivacion tardia
+                # podria llegar despues y pisarnos. El retraso deja que
+                # ocurra primero: "manual" debe quedar HABILITADO (a
+                # diferencia de "free", que se deja apagado a proposito).
+                self.root.after(400, lambda: self._pub("enable", {"on": True}))
+            self._log(f"[remoto] {src} pidio modo '{clave}'" +
+                      (f" (detuvo {', '.join(vivos)})" if vivos else ""))
+            self._publicar_ack(clave, True)
+            return
+
+        c = next((ctl for ctl in self.controladores if ctl.clave == clave), None)
+        if c is None:
+            self._log(f"[remoto] {src} pidio '{clave}': no esta entre los "
+                      f"controladores descubiertos (¿existe el .py? ¿tiene "
+                      f"'recargar'?).")
+            self._publicar_ack(clave, False, "controlador no encontrado")
+            return
+
+        try:
+            cmd = construir_cmd(c, self._valores_remotos(c))
+        except Exception as e:
+            self._log(f"[remoto] parametros invalidos para '{clave}': {e}")
+            self._publicar_ack(clave, False, f"parametros invalidos: {e}")
+            return
+
+        self._consola(c)
+        self._escribir(c.clave, "$ " + " ".join(cmd) +
+                       f"   (lanzado remotamente por {src})", "gui")
+        try:
+            self.procesos[c.clave] = Proceso(c, cmd, self.cola_proc)
+        except Exception as e:
+            self._escribir(c.clave, f"[gui] no se pudo lanzar: {e}", "gui")
+            self._publicar_ack(clave, False, f"no se pudo lanzar: {e}")
+            return
+
+        self.ctl_actual = c
+        self._log(f"[remoto] {src} lanzo {c.fichero} "
+                  f"(pid {self.procesos[c.clave].p.pid})" +
+                  (f", detuvo {', '.join(vivos)}" if vivos else ""))
+        self._foco_consola(c.clave)
+        self._publicar_ack(clave, True)
+
+    def _on_remote_stop(self, data):
+        clave = data.get("clave")  # None = detener todo lo que este vivo
+        src = data.get("src", "remoto")
+        objetivo = [clave] if clave else list(self.procesos.keys())
+        detenidos = []
+        for k in objetivo:
+            p = self.procesos.get(k)
+            if p and p.vivo():
+                p.detener()
+                self._escribir(k, f"[gui] Ctrl+C enviado (pedido remoto de "
+                                  f"{src}).", "gui")
+                detenidos.append(k)
+        self._log(f"[remoto] {src} pidio detener" +
+                  (f" {', '.join(detenidos)}" if detenidos
+                   else ": nada estaba corriendo."))
+        self._publicar_ack(clave or "todos", True)
+
     def _clave_pestana(self):
         try:
             actual = self.nb.select()
@@ -680,6 +813,14 @@ class MotorGUI:
             self._pub_pendientes[topico] = data
         self._pub_evento.set()
 
+    def _pub_unico(self, topico, data):
+        """Como _pub(), pero para eventos de una sola vez que NO deben
+        pisarse entre si (ej. "controller/ack" ante dos pedidos casi
+        simultaneos). Cada llamada se entrega, en orden, sin coalescing."""
+        with self._pub_lock:
+            self._pub_unicos.append((topico, data))
+        self._pub_evento.set()
+
     def _sp_cambia(self, _v=None):
         v = float(self.sp_var.get())
         self.lb_sp.config(text=f"{v:.0f} rpm")
@@ -700,7 +841,14 @@ class MotorGUI:
     def _pwm_cambia(self, _v=None):
         if self.owner != "manual":
             return
-        self._pub("control", {"pwm": int(self.pwm_var.get())})
+        # 'src' explicito: el cliente TCP de la GUI se llama "gui", pero el
+        # 'owner' que autoriza 'control' en modo manual es literalmente la
+        # cadena "manual" (ver arbitraje en motor_bus.py: publicar_desde()).
+        # Sin este 'src', el bus pondria src="gui" por defecto y rechazaria
+        # SIEMPRE el PWM manual (owner="manual" != src="gui"), aunque el
+        # modo sea manual de verdad -- ese era el bug real, no una caida
+        # de conexion.
+        self._pub("control", {"pwm": int(self.pwm_var.get()), "src": "manual"})
 
     def _toggle_enable(self):
         self._pub("enable", {"on": not self.enabled})
@@ -711,13 +859,14 @@ class MotorGUI:
                 p.detener()
                 self._escribir(clave, "[gui] PARADA general: Ctrl+C enviado.", "gui")
         self._pub("mode", {"owner": "manual"})
-        self._pub("control", {"pwm": 0})
+        self._pub("control", {"pwm": 0, "src": "manual"})
         self._pub("enable", {"on": False})
         self.pwm_var.set(0)
         self._log("[gui] PARADA: mando a manual, salida a cero.")
 
     def _mando_manual(self):
         self._pub("mode", {"owner": "manual"})
+        self._pub("enable", {"on": True})
         self.pwm_var.set(0)
 
     def _log(self, txt):
@@ -743,7 +892,7 @@ class MotorGUI:
                     self.procesos[c].matar()
         if self.conectado:
             try:
-                self.bus.publish("control", {"pwm": 0})
+                self.bus.publish("control", {"pwm": 0, "src": "manual"})
                 self.bus.publish("enable", {"on": False})
             except Exception:
                 pass          # si el bus ya no responde, no vale la pena esperar
@@ -800,6 +949,10 @@ class MotorGUI:
                     self.lb_sp.config(text=f"{self.sp_var.get():.0f} rpm")
             elif topico == "log":
                 self._log(f"[arduino] {data.get('msg')}")
+            elif topico == "controller/launch":
+                self._on_remote_launch(data)
+            elif topico == "controller/stop":
+                self._on_remote_stop(data)
 
         while True:                       # salida de los procesos lanzados
             try:

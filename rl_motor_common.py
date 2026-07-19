@@ -667,9 +667,19 @@ class MotorRunner:
             self._publicar_estado("parado", met)
 
     def _consigna(self, muestra):
+        """Consigna a seguir en ESTE paso del lazo real (no se usa en el
+        pre-entrenamiento acelerado, que corre sobre el modelo de planta con
+        su propia logica). 'consigna_defecto' es un ultimo recurso para el
+        caso (raro en el bus real, que siempre fusiona "setpoint" en cada
+        muestra) de que el campo directamente no venga en la muestra -- NO
+        es para sustituir un 0 real: 0 es una consigna valida (parar el
+        motor a proposito), igual que ya respeta ctl_pid.py. Antes se
+        trataba cualquier "setpoint" <= 0 como "no hay consigna todavia" y
+        se arrancaba igual con 1200 rpm sin que nadie lo pidiera.
+        """
         if self.cfg.consigna_desde_bus:
             sp = muestra.get("setpoint")
-            if sp is not None and float(sp) > 0:
+            if sp is not None:
                 return float(sp)
         return self.cfg.consigna_defecto
 

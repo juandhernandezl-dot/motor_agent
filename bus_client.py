@@ -10,8 +10,10 @@ arbitraje (eso es responsabilidad exclusiva de motor_bus.py).
 Se usa desde dos lugares con necesidades distintas:
   - mongo_motor_subscriber.py: conexion larga, se suscribe y lee eventos
     para siempre con BusClient.events().
-  - bot.py: conexion corta, solo para publicar un cambio de modo puntual
-    con BusClient.publish(...).
+  - bot.py: conexion corta, para publicar un cambio de modo puntual con
+    BusClient.publish(...), y ahora tambien para consultar con info() si
+    el controlador pedido esta realmente conectado (ver bot.py:
+    _publicar_modo_sync).
 
 Principio Simplicity First: sin dependencias externas (solo socket/json de
 la libreria estandar), sin reconexion automatica aqui -- eso lo maneja
@@ -61,6 +63,20 @@ class BusClient:
         events(), no vale la pena distinguirlos aqui."""
         self._send({"cmd": "subscribe", "topics": list(topics)})
 
+    def subscribe_and_ack(self, topics: Iterable[str]) -> Dict[str, Any]:
+        """Como subscribe(), pero para topicos SIN valor retenido (ej.
+        "controller/ack": nadie publica un valor "de bienvenida" ahi, asi
+        que el bus solo manda una linea de respuesta: el "ok" del comando).
+        La consume y la devuelve, para dejar la conexion limpia antes de
+        hacer un publish() sincrono a continuacion -- si no se consumiera,
+        ese "ok" quedaria pendiente y publish() leeria por error ESA linea
+        en vez de la respuesta real de su propio comando (este cliente no
+        distingue respuestas por id, a diferencia de motor_client.py).
+        NO usar con topicos retenidos (telemetry, mode, etc.): ahi puede
+        llegar mas de una linea y esto solo consume una."""
+        self.subscribe(topics)
+        return self._recv_line()
+
     def publish(self, topic: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Publica y devuelve la respuesta directa del bus ({"ok": ...}).
         Solo pensado para uso de "publicacion corta" (ver bot.py); si hay
@@ -71,6 +87,26 @@ class BusClient:
 
     def get(self, topic: str) -> Dict[str, Any]:
         self._send({"cmd": "get", "topic": topic})
+        return self._recv_line()
+
+    def info(self) -> Dict[str, Any]:
+        """Estado general del bus: incluye 'clientes' (nombres conectados
+        ahora mismo), 'owner' vigente, 'pwm', etc. (ver descripcion() en
+        motor_bus.py). Usado por bot.py para avisar si el controlador que
+        se pide como modo no esta realmente conectado -- cambiar el modo
+        NO arranca ningun proceso, solo cambia quien tiene permiso de
+        mandar (ver docstring de bot.py)."""
+        self._send({"cmd": "info"})
+        r = self._recv_line()
+        r.pop("ok", None)
+        return r
+
+    def next_event(self) -> Dict[str, Any]:
+        """Alias publico de _recv_line(): bloquea (respetando el timeout de
+        la conexion) hasta el proximo mensaje entrante, evento o respuesta.
+        Pensado para esperar una confirmacion puntual (ver
+        subscribe_and_ack) sin usar events() en un bucle infinito. Lanza
+        socket.timeout / OSError si no llega nada a tiempo."""
         return self._recv_line()
 
     def events(self) -> Iterator[Dict[str, Any]]:

@@ -35,6 +35,17 @@ class BusError(RuntimeError):
     pass
 
 
+class BusRechazado(BusError):
+    """El bus respondio pero RECHAZO el comando (ok=False): es un rechazo de
+    PROTOCOLO, no una caida de conexion (ej. arbitraje de 'control' cuando
+    quien publica no es el dueno del mando -- ver publicar_desde() en
+    motor_bus.py). Quien capture excepciones de BusClient debe distinguir
+    esto de una BusError "pelada" (envio fallido, timeout, socket cerrado):
+    un rechazo NO significa que el bus este caido, y no debe disparar
+    reconexion (ver _pub_worker en motor_gui.py)."""
+    pass
+
+
 class BusClient:
     """Cliente pub/sub con hilo lector. Seguro para usar desde Tk o consola."""
 
@@ -160,7 +171,10 @@ class BusClient:
                     break
                 # respuesta atrasada de un comando anterior -> descartada
         if not r.get("ok", False):
-            raise BusError(r.get("error", "error desconocido"))
+            # RECHAZO de protocolo (ej. arbitraje de 'control'), no una
+            # caida de conexion: BusRechazado, no BusError pelada. Ver
+            # docstring de BusRechazado arriba.
+            raise BusRechazado(r.get("error", "error desconocido"))
         return r
 
     # ---- API -----------------------------------------------------------------

@@ -7,8 +7,12 @@ Dos tipos de interaccion, en texto o en voz:
      setpoint?") -> se responden con un LLM local (LM Studio / Qwen3.5-4B),
      usando el estado real leido de MongoDB Atlas como contexto.
   2) Comandos de control ("cambia el modo a qlearning") -> se detectan con
-     una regla simple (sin LLM de por medio) y se publican directo al bus
-     (motor_bus.py) por TCP, topico "mode".
+     una regla simple (sin LLM de por medio) y se publican al bus, topico
+     "controller/launch". Este bot NO detiene ni lanza procesos el mismo
+     (no tiene permiso de tocar los subprocesos de otro programa):
+     motor_gui.py es quien escucha ese topico, detiene con Ctrl+C el
+     controlador que este corriendo y lanza el pedido -- este bot espera su
+     confirmacion real en "controller/ack" antes de responder al usuario.
 
 Voz (portada de huerto-bot/bot.py, mismo patron, Surgical Changes: solo se
 copian las piezas de audio, la logica de dominio -- deteccion de modo,
@@ -22,8 +26,13 @@ bus, Mongo -- es la que ya tenia este bot):
 
 Arquitectura real del bus (ver motor_bus.py):
   Arduino Mega <--serie--> motor_bus.py <--TCP 127.0.0.1:8770--> N clientes
-  Este bot es un cliente mas: publica {"cmd":"publish","topic":"mode",
-  "data":{"owner":...}} cuando alguien pide cambiar de modo.
+  Este bot es un cliente mas: publica {"cmd":"publish","topic":
+  "controller/launch","data":{"clave":...,"src":"telegram:<chat_id>"}}
+  cuando alguien pide cambiar de modo, y espera la respuesta real de
+  motor_gui.py en el topico "controller/ack" (ver _cambiar_controlador_sync).
+  Para "manual"/"free" (que no tienen script propio) motor_gui.py solo
+  cambia el "mode" del bus; para el resto, detiene lo que este vivo y
+  lanza el proceso pedido -- este bot ya NO lanza ni mata subprocesos.
 
 Los "owner" validos del bus son: manual, pid, qlearning, sarsa_lambda,
 reinforce, free (el motivo por el que se agrego "pid": ctl_pid.py toma el
@@ -53,8 +62,10 @@ import io
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
+import time
 import wave
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -99,6 +110,10 @@ REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "60"))
 BUS_HOST = os.environ.get("BUS_HOST", "127.0.0.1")
 BUS_PORT = int(os.environ.get("BUS_PORT", "8770"))
 BUS_TIMEOUT_S = float(os.environ.get("BUS_TIMEOUT_S", "3"))
+# Cambiar de controlador implica que motor_gui.py detenga el anterior
+# (Ctrl+C, hasta unos segundos) y lance el nuevo proceso; por eso este
+# timeout es más largo que BUS_TIMEOUT_S (que es solo para un publish suelto).
+CONTROLLER_ACK_TIMEOUT_S = float(os.environ.get("CONTROLLER_ACK_TIMEOUT_S", "12"))
 
 # --------------------------------------------------------------------------
 # Configuración de voz (STT: faster-whisper / TTS: Piper) -- igual que
@@ -306,37 +321,85 @@ def detectar_comando_modo(texto: str) -> Optional[str]:
     RL distintos (qlearning/sarsa_lambda/reinforce) y adivinar mal
     arrancaría el que no es. Aplica igual si el texto viene de una nota de
     voz transcrita.
+
+    Caso especial: un mensaje CORTO (<=2 palabras) que ES literalmente el
+    nombre de un modo -- "Qlearning", "Sarsa lambda", "Manual" -- se trata
+    como pedido de cambio aunque no lleve "modo"/"cambia" (nadie dice solo
+    el nombre de un algoritmo si no es para activarlo). Sin esto, ese
+    mensaje caía derecho al LLM, que a veces ALUCINABA que sí habia
+    cambiado el modo sin haber pasado por el bus para nada (bug real
+    reportado: el bot "mentía" con mensajes de una sola palabra).
+    Mensajes mas largos que mencionan un modo de paso (ej. "¿cómo va el
+    pid?") NO activan esto -- esos siguen yendo al LLM como pregunta.
     """
     t = texto.lower()
     pide_cambio = "modo" in t or "cambia" in t or "cambiar" in t or "pon" in t
-    if not pide_cambio:
+    if not pide_cambio and len(t.split()) > 2:
         return None
     for modo, sinonimos in _SINONIMOS_MODO.items():
         if any(s in t for s in sinonimos):
             return modo
-    return "ambiguo"
+    return "ambiguo" if pide_cambio else None
 
 
-def _publicar_modo_sync(modo: str, chat_id: int) -> None:
+def _cambiar_controlador_sync(modo: str, chat_id: int) -> str:
     """Conexión de una sola vez (no persistente) al bus: estos comandos son
-    esporádicos, no de alta frecuencia, así que no vale la pena mantener
-    una conexión abierta todo el tiempo. Bloqueante a propósito -- se llama
-    siempre desde un hilo aparte (ver enviar_comando_modo)."""
-    client = BusClient(BUS_HOST, BUS_PORT, name=f"telegram:{chat_id}", timeout=BUS_TIMEOUT_S)
+    esporádicos, no de alta frecuencia. Bloqueante a propósito -- se llama
+    siempre desde un hilo aparte (ver enviar_comando_modo).
+
+    Publica en "controller/launch" (motor_gui.py es quien escucha ese
+    tópico, detiene con Ctrl+C cualquier controlador vivo, y lanza el
+    pedido -- o solo cambia el modo, si es manual/free, que no tienen
+    script propio). Cambiar de modo por Telegram ya NO es "publicar y
+    confiar": se espera la confirmación real en "controller/ack" antes de
+    responderle al usuario, porque si motor_gui.py no está corriendo nadie
+    va a detener/lanzar nada aunque el bus acepte el publish sin problema.
+
+    Devuelve el mensaje final para el usuario (éxito, rechazo, o timeout).
+    """
+    client = BusClient(BUS_HOST, BUS_PORT, name=f"telegram:{chat_id}", timeout=CONTROLLER_ACK_TIMEOUT_S)
     try:
-        respuesta = client.publish("mode", {"owner": modo})
+        # Sin esto, el "ok" de este subscribe quedaría pendiente y el
+        # publish() de abajo leería por error ESA línea como si fuera su
+        # propia respuesta (ver el docstring de subscribe_and_ack en
+        # bus_client.py). "controller/ack" no es un tópico retenido, así
+        # que basta con consumir una sola línea aquí.
+        client.subscribe_and_ack(["controller/ack"])
+
+        respuesta = client.publish("controller/launch", {"clave": modo, "src": f"telegram:{chat_id}"})
         if not respuesta.get("ok", False):
             raise RuntimeError(respuesta.get("error", "el bus rechazó el comando"))
+
+        limite = time.time() + CONTROLLER_ACK_TIMEOUT_S
+        while time.time() < limite:
+            try:
+                msg = client.next_event()
+            except (socket.timeout, OSError):
+                break
+            if msg.get("type") != "event" or msg.get("topic") != "controller/ack":
+                continue
+            data = msg.get("data") or {}
+            if data.get("clave") != modo:
+                continue  # confirmacion de otro pedido en vuelo; sigue esperando
+            if data.get("ok"):
+                return f"Listo, {modo} tiene el control del motor ahora."
+            return f"No pude cambiar a {modo}: {data.get('error', 'la GUI lo rechazó')}."
+
+        return (
+            f"Pedí el cambio a {modo}, pero nadie confirmó a tiempo. "
+            f"¿Está abierta motor_gui.py? Sin ella no se puede detener el "
+            f"controlador anterior ni lanzar el nuevo."
+        )
     finally:
         client.close()
 
 
-async def enviar_comando_modo(modo: str, chat_id: int) -> None:
-    """Publica el cambio de modo en el bus sin bloquear el loop de asyncio
-    de python-telegram-bot (BusClient usa sockets bloqueantes a propósito,
-    ver bus_client.py -- Simplicity First: no hace falta un cliente TCP
-    asíncrono para un comando esporádico de una sola línea)."""
-    await asyncio.to_thread(_publicar_modo_sync, modo, chat_id)
+async def enviar_comando_modo(modo: str, chat_id: int) -> str:
+    """Pide el cambio de controlador sin bloquear el loop de asyncio de
+    python-telegram-bot (BusClient usa sockets bloqueantes a propósito, ver
+    bus_client.py). Devuelve el mensaje final para el usuario (ver
+    _cambiar_controlador_sync)."""
+    return await asyncio.to_thread(_cambiar_controlador_sync, modo, chat_id)
 
 
 # --------------------------------------------------------------------------
@@ -355,10 +418,9 @@ async def procesar_mensaje_texto(chat_id: int, user_text: str) -> str:
 
     if modo_pedido is not None:
         try:
-            await enviar_comando_modo(modo_pedido, chat_id)
-            return f"Listo, mandé la orden de cambiar a modo {modo_pedido}."
+            return await enviar_comando_modo(modo_pedido, chat_id)
         except Exception:
-            log.exception("Fallo al publicar 'mode' en el bus")
+            log.exception("Fallo al publicar 'controller/launch' en el bus")
             return "No pude comunicarme con el bus para cambiar el modo. ¿Está corriendo motor_bus.py?"
 
     try:
@@ -373,12 +435,28 @@ async def procesar_mensaje_texto(chat_id: int, user_text: str) -> str:
 # huerto-bot/bot.py, son funciones genéricas de audio, sin nada específico
 # del dominio del huerto ni del motor.
 # --------------------------------------------------------------------------
+# Whisper (sobre todo en modelos chicos/medianos) tiende a "oir" jerga
+# técnica en inglés dicha con acento como palabras comunes en español --
+# de ahi transcripciones reales vistas en producción como "Cool Learning"
+# o "Kill Learning" en vez de "qlearning". Pasarle estos nombres como
+# initial_prompt (contexto que Whisper prefiere al decidir entre palabras
+# acústicamente parecidas) no lo garantiza, pero ayuda notablemente sin
+# tocar el modelo ni el tamaño.
+_VOCABULARIO_MODOS = (
+    "manual, PID, qlearning, sarsa_lambda, reinforce, free, "
+    "cambia el modo a qlearning, cambia el modo a sarsa_lambda, "
+    "cambia el modo a reinforce, cambia el modo a PID, "
+    "cambia el modo a manual, cambia el modo a free"
+)
+
+
 def transcribe_audio(audio_path: str) -> str:
     """Transcribe un archivo de audio (cualquier formato que ffmpeg soporte,
     incluido el .oga/Opus de las notas de voz de Telegram) a texto en español.
     """
     segments, _info = get_whisper_model().transcribe(
-        audio_path, language=WHISPER_LANGUAGE, beam_size=1
+        audio_path, language=WHISPER_LANGUAGE, beam_size=1,
+        initial_prompt=_VOCABULARIO_MODOS,
     )
     # segments es un generador: hay que consumirlo para que se genere el texto.
     return " ".join(segment.text for segment in segments).strip()
@@ -449,6 +527,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await tg_file.download_to_drive(tmp_path)
 
         user_text = transcribe_audio(tmp_path)
+        log.info("Transcripcion de %s: %r", tmp_path, user_text)
         if not user_text:
             await update.message.reply_text(
                 "No logré entender el audio. ¿Puedes intentar de nuevo, por favor?"
