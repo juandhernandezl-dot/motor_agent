@@ -648,8 +648,17 @@ class MotorGUI:
         "reinforce": {"Modo": "--controlar", "Ritmo": "--directo"},
     }
 
-    def _valores_remotos(self, c):
-        overrides = self._REMOTO_OVERRIDES.get(c.clave, {})
+    def _valores_remotos(self, c, data=None):
+        """'data' es el payload crudo de "controller/launch". Si trae
+        'entrenar'/'ritmo' (ver bot.py::_cambiar_controlador_sync), pisan el
+        default de _REMOTO_OVERRIDES; si no vienen, el comportamiento es
+        IDÉNTICO al de siempre (--controlar --directo)."""
+        overrides = dict(self._REMOTO_OVERRIDES.get(c.clave, {}))
+        if data:
+            if data.get("entrenar"):
+                overrides["Modo"] = data["entrenar"]
+            if data.get("ritmo"):
+                overrides["Ritmo"] = data["ritmo"]
         return {i: overrides.get(p.get("etiqueta", ""), p.get("default"))
                 for i, p in enumerate(c.params)}
 
@@ -671,15 +680,6 @@ class MotorGUI:
 
         if clave in ("manual", "free"):
             self._pub("mode", {"owner": clave})
-            if clave == "manual":
-                # El controlador que se acaba de detener (si habia uno)
-                # publica su propio "enable=False" al morir (ver finally:
-                # de ctl_pid.py / rl_motor_common.py). Si publicaramos
-                # "enable=True" de inmediato, esa desactivacion tardia
-                # podria llegar despues y pisarnos. El retraso deja que
-                # ocurra primero: "manual" debe quedar HABILITADO (a
-                # diferencia de "free", que se deja apagado a proposito).
-                self.root.after(400, lambda: self._pub("enable", {"on": True}))
             self._log(f"[remoto] {src} pidio modo '{clave}'" +
                       (f" (detuvo {', '.join(vivos)})" if vivos else ""))
             self._publicar_ack(clave, True)
@@ -694,7 +694,7 @@ class MotorGUI:
             return
 
         try:
-            cmd = construir_cmd(c, self._valores_remotos(c))
+            cmd = construir_cmd(c, self._valores_remotos(c, data))
         except Exception as e:
             self._log(f"[remoto] parametros invalidos para '{clave}': {e}")
             self._publicar_ack(clave, False, f"parametros invalidos: {e}")
@@ -866,7 +866,6 @@ class MotorGUI:
 
     def _mando_manual(self):
         self._pub("mode", {"owner": "manual"})
-        self._pub("enable", {"on": True})
         self.pwm_var.set(0)
 
     def _log(self, txt):

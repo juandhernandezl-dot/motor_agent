@@ -61,6 +61,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -287,9 +288,13 @@ def ask_llm(chat_id: int, user_text: str) -> str:
     # historial (ej. "no tengo datos", de un turno anterior sin Mongo)
     # queda mas cerca de la pregunta que el dato fresco, y el modelo repite
     # la negativa vieja en vez de leer el estado actual.
+    # NOTA: este mensaje va como "user", no "system" -- la plantilla de chat
+    # de Qwen3.5 exige que el UNICO "system" sea el primero de la lista
+    # (LM Studio rechazaba con 400 "System message must be at the
+    # beginning" cuando este iba como "system" en medio del historial).
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(_history[chat_id])
-    messages.append({"role": "system", "content": f"Estado actual: {status_context}"})
+    messages.append({"role": "user", "content": f"Estado actual: {status_context}"})
     messages.append({"role": "user", "content": user_text})
 
     response = llm_client.chat.completions.create(
@@ -299,6 +304,11 @@ def ask_llm(chat_id: int, user_text: str) -> str:
         top_p=0.8,
         max_tokens=250,
         timeout=REQUEST_TIMEOUT_S,
+        # Qwen3.5 piensa (<think>...</think>) antes de responder por
+        # default -- en la Pi eso es varios minutos extra por mensaje.
+        # Si LM Studio ignora este flag para esta plantilla, quítalo:
+        # no cambia nada más.
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     reply = response.choices[0].message.content.strip()
 
@@ -342,7 +352,32 @@ def detectar_comando_modo(texto: str) -> Optional[str]:
     return "ambiguo" if pide_cambio else None
 
 
-def _cambiar_controlador_sync(modo: str, chat_id: int) -> str:
+def detectar_comando_entrenamiento(texto: str) -> Optional[str]:
+    """Devuelve '--entrenar', '--reentrenar' o None. Solo tiene efecto si el
+    MISMO mensaje también pide un modo RL (ver procesar_mensaje_texto); a
+    secas ("reentrena") no significa nada sin decir a qué controlador."""
+    t = texto.lower()
+    if "reentrena" in t or "desde cero" in t:
+        return "--reentrenar"
+    if "entrena" in t or "sigue aprendiendo" in t or "sigue entrenando" in t:
+        return "--entrenar"
+    return None
+
+
+def detectar_comando_ritmo(texto: str) -> Optional[str]:
+    """Devuelve '--acelerado', '--directo' o None. Mismo alcance que
+    detectar_comando_entrenamiento: solo aplica junto a un modo RL."""
+    t = texto.lower()
+    if "acelerado" in t or "pre-entrena" in t or "preentrena" in t:
+        return "--acelerado"
+    if "directo" in t or "motor real" in t:
+        return "--directo"
+    return None
+
+
+def _cambiar_controlador_sync(modo: str, chat_id: int,
+                               entrenar: Optional[str] = None,
+                               ritmo: Optional[str] = None) -> str:
     """Conexión de una sola vez (no persistente) al bus: estos comandos son
     esporádicos, no de alta frecuencia. Bloqueante a propósito -- se llama
     siempre desde un hilo aparte (ver enviar_comando_modo).
@@ -355,6 +390,11 @@ def _cambiar_controlador_sync(modo: str, chat_id: int) -> str:
     responderle al usuario, porque si motor_gui.py no está corriendo nadie
     va a detener/lanzar nada aunque el bus acepte el publish sin problema.
 
+    'entrenar'/'ritmo' son opcionales y solo tienen sentido para los tres
+    controladores RL (ver motor_gui.py::_valores_remotos); si no se pasan,
+    motor_gui.py sigue forzando su default seguro de siempre
+    (--controlar --directo).
+
     Devuelve el mensaje final para el usuario (éxito, rechazo, o timeout).
     """
     client = BusClient(BUS_HOST, BUS_PORT, name=f"telegram:{chat_id}", timeout=CONTROLLER_ACK_TIMEOUT_S)
@@ -366,7 +406,13 @@ def _cambiar_controlador_sync(modo: str, chat_id: int) -> str:
         # que basta con consumir una sola línea aquí.
         client.subscribe_and_ack(["controller/ack"])
 
-        respuesta = client.publish("controller/launch", {"clave": modo, "src": f"telegram:{chat_id}"})
+        payload = {"clave": modo, "src": f"telegram:{chat_id}"}
+        if entrenar:
+            payload["entrenar"] = entrenar
+        if ritmo:
+            payload["ritmo"] = ritmo
+
+        respuesta = client.publish("controller/launch", payload)
         if not respuesta.get("ok", False):
             raise RuntimeError(respuesta.get("error", "el bus rechazó el comando"))
 
@@ -394,12 +440,59 @@ def _cambiar_controlador_sync(modo: str, chat_id: int) -> str:
         client.close()
 
 
-async def enviar_comando_modo(modo: str, chat_id: int) -> str:
+async def enviar_comando_modo(modo: str, chat_id: int,
+                               entrenar: Optional[str] = None,
+                               ritmo: Optional[str] = None) -> str:
     """Pide el cambio de controlador sin bloquear el loop de asyncio de
     python-telegram-bot (BusClient usa sockets bloqueantes a propósito, ver
     bus_client.py). Devuelve el mensaje final para el usuario (ver
     _cambiar_controlador_sync)."""
-    return await asyncio.to_thread(_cambiar_controlador_sync, modo, chat_id)
+    return await asyncio.to_thread(_cambiar_controlador_sync, modo, chat_id, entrenar, ritmo)
+
+
+# --------------------------------------------------------------------------
+# Comando de setpoint -- a diferencia del modo, NO pasa por motor_gui.py ni
+# relanza nada: "setpoint" ya es un tópico retenido de escritura libre en
+# motor_bus.py (ver publicar_desde), así que esto es un publish directo.
+# --------------------------------------------------------------------------
+_RE_SETPOINT = re.compile(
+    r"(?:setpoint|consigna|rpm)\D{0,15}?(\d+(?:[.,]\d+)?)", re.IGNORECASE
+)
+
+
+def detectar_comando_setpoint(texto: str) -> Optional[float]:
+    """Devuelve el RPM pedido, o None. Deterministico a propósito -- igual
+    que detectar_comando_modo, no se le pide al LLM que interprete un
+    número para hardware real."""
+    t = texto.lower()
+    if not any(p in t for p in ("setpoint", "consigna", "rpm")):
+        return None
+    m = _RE_SETPOINT.search(t)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _cambiar_setpoint_sync(rpm: float, chat_id: int) -> str:
+    """Publish directo y bloqueante (mismo motivo que _cambiar_controlador_sync:
+    se llama desde un hilo aparte). No hay "ack" que esperar aquí -- el motor
+    ya está corriendo, publicar en "setpoint" no relanza ni detiene nada."""
+    client = BusClient(BUS_HOST, BUS_PORT, name=f"telegram:{chat_id}", timeout=BUS_TIMEOUT_S)
+    try:
+        respuesta = client.publish("setpoint", {"rpm": rpm, "src": f"telegram:{chat_id}"})
+        if respuesta.get("ok", False):
+            return f"Listo, consigna en {rpm:.0f} rpm."
+        return f"No pude cambiar la consigna: {respuesta.get('error', 'el bus la rechazó')}."
+    finally:
+        client.close()
+
+
+async def enviar_comando_setpoint(rpm: float, chat_id: int) -> str:
+    """Igual que enviar_comando_modo: no bloquea el loop de asyncio."""
+    return await asyncio.to_thread(_cambiar_setpoint_sync, rpm, chat_id)
 
 
 # --------------------------------------------------------------------------
@@ -411,20 +504,41 @@ async def procesar_mensaje_texto(chat_id: int, user_text: str) -> str:
     pregunta para el LLM, actúa en consecuencia, y devuelve la respuesta
     en texto (que el handler de texto o de voz se encarga de entregar en
     el formato que corresponda)."""
+    # El setpoint se revisa PRIMERO. Motivo: "pon"/"cambia"/"cambiar" son
+    # gatillo de detectar_comando_modo (pide_cambio), así que un mensaje
+    # como "pon el setpoint en 1800" quedaba interceptado ahí como
+    # "ambiguo" -- ningún sinónimo de modo coincide -- y nunca llegaba a
+    # detectar_comando_setpoint. Bug real visto en producción. Revisarlo
+    # primero es seguro: exige palabra clave + número, así que no le quita
+    # mensajes reales a detectar_comando_modo (los nombres de modo no son
+    # numéricos).
+    rpm_pedido = detectar_comando_setpoint(user_text)
+    if rpm_pedido is not None:
+        try:
+            return await enviar_comando_setpoint(rpm_pedido, chat_id)
+        except Exception:
+            log.exception("Fallo al publicar 'setpoint' en el bus")
+            return "No pude comunicarme con el bus para cambiar la consigna. ¿Está corriendo motor_bus.py?"
+
     modo_pedido = detectar_comando_modo(user_text)
 
     if modo_pedido == "ambiguo":
         return "¿A cuál modo? Puedo cambiar a: manual, pid, qlearning, sarsa_lambda, reinforce o free."
 
     if modo_pedido is not None:
+        # entrenar/ritmo solo tienen sentido para los tres controladores RL
+        # (manual/pid/free no tienen esos parámetros en su CONTROLLER).
+        es_rl = modo_pedido in ("qlearning", "sarsa_lambda", "reinforce")
+        entrenar = detectar_comando_entrenamiento(user_text) if es_rl else None
+        ritmo = detectar_comando_ritmo(user_text) if es_rl else None
         try:
-            return await enviar_comando_modo(modo_pedido, chat_id)
+            return await enviar_comando_modo(modo_pedido, chat_id, entrenar, ritmo)
         except Exception:
             log.exception("Fallo al publicar 'controller/launch' en el bus")
             return "No pude comunicarme con el bus para cambiar el modo. ¿Está corriendo motor_bus.py?"
 
     try:
-        return ask_llm(chat_id, user_text)
+        return await asyncio.to_thread(ask_llm, chat_id, user_text)
     except Exception:
         log.exception("Fallo al consultar el LLM local (¿está LM Studio encendido?)")
         return "No pude pensar bien la respuesta en este momento. Intenta de nuevo."
@@ -526,7 +640,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         tg_file = await update.message.voice.get_file()
         await tg_file.download_to_drive(tmp_path)
 
-        user_text = transcribe_audio(tmp_path)
+        user_text = await asyncio.to_thread(transcribe_audio, tmp_path)
         log.info("Transcripcion de %s: %r", tmp_path, user_text)
         if not user_text:
             await update.message.reply_text(
@@ -551,7 +665,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # quedarse sin nada (incluye el caso de un comando de cambio de modo:
     # también se confirma por voz).
     try:
-        ogg_bytes = synthesize_speech_ogg(reply)
+        ogg_bytes = await asyncio.to_thread(synthesize_speech_ogg, reply)
         await update.message.reply_voice(voice=io.BytesIO(ogg_bytes))
     except Exception:
         log.exception("Falló la síntesis de voz; respondo en texto como respaldo")

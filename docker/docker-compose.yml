@@ -1,0 +1,80 @@
+# Vive en motor_agent/docker/ (DENTRO del repo, a diferencia del intento
+# anterior). context/volumes usan '..' porque el código está un nivel
+# arriba de este archivo.
+#
+# A propósito arranca motor_bus en --sim por defecto: así 'docker compose
+# up -d' SIEMPRE funciona, tengas o no el Arduino conectado. Para el
+# Arduino real, se agrega docker-compose.hardware.yml encima (ver
+# GUIA_OPERACION.md) -- eso fue justo lo que falló la primera vez: mapear
+# /dev/ttyACM0 sin condición, incluso cuando el plan era simular.
+
+services:
+  motor_bus:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      # Se leen de un docker/.env local a cada máquina (NO el .env del
+      # proyecto en '..' -- Compose interpola ${...} con el .env que está
+      # junto a este archivo). Sin docker/.env, caen en los defaults del
+      # Dockerfile (small/int8). Así "docker compose build" a secas ya
+      # hornea la talla correcta de esta máquina, sin depender de acordarse
+      # de pasar --build-arg cada vez.
+      args:
+        WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-small}
+        WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+    image: motor_agent:latest
+    network_mode: host
+    volumes:
+      - ..:/app
+    working_dir: /app
+    env_file: ../.env
+    command: python3 motor_bus.py --sim
+    restart: unless-stopped
+
+  mongo_subscriber:
+    image: motor_agent:latest
+    network_mode: host
+    volumes:
+      - ..:/app
+    working_dir: /app
+    env_file: ../.env
+    # --db/--telemetria-collection/--eventos-collection explícitos para
+    # que este servicio SIEMPRE lea la misma base/colecciones que bot.py.
+    command: >
+      sh -c 'python3 mongo_motor_subscriber.py
+      --mongo-uri "$$MONGO_URI"
+      --bus-host "$$BUS_HOST"
+      --bus-port "$$BUS_PORT"
+      --db "$$MONGO_DB"
+      --telemetria-collection "$$MONGO_COLLECTION"
+      --eventos-collection "$$EVENTOS_COLLECTION"'
+    depends_on:
+      - motor_bus
+    restart: unless-stopped
+
+  motor_gui:
+    image: motor_agent:latest
+    network_mode: host
+    volumes:
+      - ..:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    working_dir: /app
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+    env_file: ../.env
+    command: python3 motor_gui.py
+    depends_on:
+      - motor_bus
+    restart: unless-stopped
+
+  bot:
+    image: motor_agent:latest
+    network_mode: host
+    volumes:
+      - ..:/app
+    working_dir: /app
+    env_file: ../.env
+    command: python3 bot.py
+    depends_on:
+      - motor_bus
+    restart: unless-stopped

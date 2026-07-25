@@ -1,0 +1,12 @@
+# Override: agrega el Arduino real sobre el docker-compose.yml base.
+# Uso (desde motor_agent/docker/):
+#   docker compose -f docker-compose.yml -f docker-compose.hardware.yml up -d
+#
+# Nunca se usa solo -- Compose combina este archivo CON el base, no lo
+# reemplaza. Ajusta el puerto en las DOS líneas de abajo si tu Arduino no
+# aparece como /dev/ttyACM0 (`ls /dev/ttyACM* /dev/ttyUSB*` para revisar).
+services:
+  motor_bus:
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+    command: python3 motor_bus.py --serial /dev/ttyACM0
