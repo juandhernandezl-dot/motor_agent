@@ -1,14 +1,54 @@
-# Vive en motor_agent/docker/ (DENTRO del repo, a diferencia del intento
-# anterior). context/volumes usan '..' porque el código está un nivel
-# arriba de este archivo.
+# Vive en motor_agent/docker/ (DENTRO del repo). context/volumes usan '..'
+# porque el código está un nivel arriba de este archivo.
 #
 # A propósito arranca motor_bus en --sim por defecto: así 'docker compose
 # up -d' SIEMPRE funciona, tengas o no el Arduino conectado. Para el
 # Arduino real, se agrega docker-compose.hardware.yml encima (ver
-# GUIA_OPERACION.md) -- eso fue justo lo que falló la primera vez: mapear
-# /dev/ttyACM0 sin condición, incluso cuando el plan era simular.
+# GUIA_OPERACION.md).
 
 services:
+  # MongoDB LOCAL, para no depender de Atlas (ni del wifi) durante la
+  # operación normal. Ver GUIA_OPERACION.md para la migración desde
+  # Atlas y para volver a Atlas si hace falta -- se decide entero desde
+  # MONGO_URI en el .env, este servicio no impone nada.
+  #
+  # mongo:7 (no 8, no 'latest') a propósito: rama estable confirmada
+  # como compatible con el Cortex-A76 del Pi 5. MongoDB 5.0+ exige
+  # microarquitectura ARMv8.2-A o superior en arm64 -- el Pi 5 la cumple,
+  # un Pi 4 (ARMv8.0-A) NO, moriría con "Illegal instruction" al
+  # arrancar. Y 5.0+ es obligatorio de todas formas porque
+  # mongo_setup_motor.js crea una time series collection.
+  mongo:
+    image: mongo:7
+    network_mode: host
+    # --bind_ip 127.0.0.1 NO es opcional aquí: con network_mode host, el
+    # default de la imagen (0.0.0.0) dejaría la base escuchando en toda
+    # la red local SIN autenticación. Atada a localhost, solo la alcanzan
+    # procesos de esta misma máquina, que es justo lo que necesitan los
+    # otros servicios (todos usan network_mode host también).
+    #
+    # --port 27018, NO el 27017 de siempre: con network_mode host no hay
+    # aislamiento de puertos entre el contenedor y el resto de la
+    # máquina -- si este equipo también corre un mongod nativo para otro
+    # proyecto (huerto-ml/huerto-bot) en el 27017 de toda la vida, los
+    # dos chocarían por el mismo puerto cada vez que ambos intenten
+    # correr a la vez. En 27018 conviven sin que haya que apagar uno
+    # para prender el otro.
+    command: ["--bind_ip", "127.0.0.1", "--port", "27018"]
+    volumes:
+      # Volumen NOMBRADO, no bind mount: los datos viven en un área que
+      # Docker gestiona, no dentro del repo -- así no hay riesgo de
+      # commitear la base por accidente ni de que un rebuild la toque.
+      # Sobrevive a 'docker compose down'. Se borra SOLO con 'down -v'.
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27018", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
   motor_bus:
     build:
       context: ..
@@ -16,9 +56,7 @@ services:
       # Se leen de un docker/.env local a cada máquina (NO el .env del
       # proyecto en '..' -- Compose interpola ${...} con el .env que está
       # junto a este archivo). Sin docker/.env, caen en los defaults del
-      # Dockerfile (small/int8). Así "docker compose build" a secas ya
-      # hornea la talla correcta de esta máquina, sin depender de acordarse
-      # de pasar --build-arg cada vez.
+      # Dockerfile (small/int8).
       args:
         WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-small}
         WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
@@ -49,7 +87,14 @@ services:
       --telemetria-collection "$$MONGO_COLLECTION"
       --eventos-collection "$$EVENTOS_COLLECTION"'
     depends_on:
-      - motor_bus
+      # service_healthy, no solo service_started: este script hace un
+      # ping a Mongo en su __init__ y se cae si la base no responde
+      # todavía. 'depends_on' a secas solo espera a que el contenedor
+      # arranque, no a que mongod esté listo para aceptar conexiones.
+      mongo:
+        condition: service_healthy
+      motor_bus:
+        condition: service_started
     restart: unless-stopped
 
   motor_gui:
@@ -64,7 +109,8 @@ services:
     env_file: ../.env
     command: python3 motor_gui.py
     depends_on:
-      - motor_bus
+      motor_bus:
+        condition: service_started
     restart: unless-stopped
 
   bot:
@@ -76,5 +122,13 @@ services:
     env_file: ../.env
     command: python3 bot.py
     depends_on:
-      - motor_bus
+      # El bot NO espera a que Mongo esté sano: está diseñado para seguir
+      # respondiendo aunque la base esté caída (solo avisa que no hay
+      # telemetría). Exigirle service_healthy lo dejaría sin arrancar por
+      # algo de lo que ya sabe recuperarse solo.
+      motor_bus:
+        condition: service_started
     restart: unless-stopped
+
+volumes:
+  mongo_data:

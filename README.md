@@ -9,8 +9,10 @@ frentes:
    algoritmos de RL (Q-learning, SARSA(λ), REINFORCE) compiten por el
    mando del motor a través de un bus TCP/JSON propio (`motor_bus.py`).
 2. **Telemetría persistente**: cada muestra del motor se escribe en
-   MongoDB Atlas (`mongo_motor_subscriber.py`), separando la operación
-   en tiempo real (el bus) de su registro histórico (la base de datos).
+   MongoDB (`mongo_motor_subscriber.py`), separando la operación en
+   tiempo real (el bus) de su registro histórico (la base de datos). La
+   base corre **local, dentro de Docker** (`mongo:7`); Atlas sigue
+   siendo una opción, se elige con `MONGO_URI` en el `.env`.
 3. **Interfaz conversacional**: un bot de Telegram (`bot.py`) que
    responde preguntas sobre el estado del motor usando un LLM local
    (Qwen3.5-4B vía LM Studio) y ejecuta comandos deterministas (cambio
@@ -21,15 +23,18 @@ cambios a GitHub ver `SUBIR_A_GITHUB.md`.
 
 ## Despliegues activos
 
-El proyecto corre en dos máquinas **independientes a propósito**, cada
-una con su propio cluster de MongoDB Atlas — no comparten datos ni están
-pensadas para operar el mismo motor a la vez:
+El proyecto corre en dos máquinas **independientes a propósito** — no
+comparten datos ni están pensadas para operar el mismo motor a la vez.
+Cada una tiene ahora su propia base local en Docker (volumen
+`mongo_data`); los clusters de Atlas de cada una quedan como respaldo
+histórico, no como destino activo:
 
 | | Raspberry Pi 5 | Escritorio (ASUS TUF A15) |
 |---|---|---|
 | Rol | Despliegue con el Quanser real | Desarrollo / pruebas |
 | Arquitectura | aarch64 | x86_64 |
-| Cluster Mongo | `cluster0.boten8d.mongodb.net` | `motorcluster.qulsskv.mongodb.net` |
+| Base de datos | Local en Docker (`mongo_data`) | Local en Docker (`mongo_data`) |
+| Cluster Atlas (respaldo) | `cluster0.boten8d.mongodb.net` | `motorcluster.qulsskv.mongodb.net` |
 | `WHISPER_MODEL_SIZE` | `small` (CPU sin margen) | `medium` (CPU más holgada) |
 
 Docker hace que el mismo `Dockerfile`/`docker-compose.yml` sirva para
@@ -45,8 +50,11 @@ Decisión deliberada, no por defecto:
 - **Privacidad/autonomía**: el sistema de control (hardware real, datos
   del motor) no depende de que un tercero externo esté disponible para
   que el operador pueda preguntarle algo al bot.
-- **Offline por diseño**: salvo la escritura a MongoDB Atlas, el lazo de
-  control + LLM + voz corre completo sin internet.
+- **Offline por diseño**: con la base de datos ya local (ver
+  "Despliegues activos"), el sistema completo — lazo de control, LLM,
+  voz y persistencia — corre sin internet. Lo único que sigue
+  necesitando red es el propio Telegram, por ser un servicio externo por
+  naturaleza.
 
 El costo de esta decisión es real y está documentado: en hardware sin
 GPU dedicada, la latencia del LLM (1-3 minutos en preguntas complejas en
@@ -60,8 +68,8 @@ tenía el setup manual:
 - **Reproducibilidad**: instalar el stack completo (`ffmpeg`,
   `python3-tk`, las dependencias de audio/ML) deja de depender de
   recordar cada paso manual.
-- **Aislamiento sin perder simplicidad**: los 4 procesos (bot, bus,
-  subscriber, gui) quedan separados y reiniciables de forma
+- **Aislamiento sin perder simplicidad**: los 5 servicios (bot, bus,
+  subscriber, gui, mongo) quedan separados y reiniciables de forma
   independiente, con `network_mode: host` -- deliberadamente la opción
   mas simple posible para un solo equipo, no un clúster.
 - **Portabilidad real, ya probada**: el mismo `Dockerfile` corrió sin
@@ -82,7 +90,7 @@ motor_agent/
   .gitignore
   docker/
     Dockerfile
-    docker-compose.yml                base, modo --sim
+    docker-compose.yml                base: mongo + bus(--sim) + subscriber + gui + bot
     docker-compose.hardware.yml       override, Arduino real
     .env                               SOLO build args (WHISPER_MODEL_SIZE/COMPUTE_TYPE), nunca al repo
   GUIA_OPERACION.md
@@ -183,10 +191,14 @@ paso a paso.
   costo/latencia a cambio de privacidad y autonomía offline.
 - `motor_gui.py` dentro de Docker depende de un servidor X activo en el
   host (no funciona headless, con o sin Docker de por medio).
-- La IP pública de cada máquina es dinámica; el Network Access de
-  MongoDB Atlas de cada cluster requiere actualizarse manualmente
-  cuando cambia.
-- Los dos clusters de Mongo (Pi / escritorio) no se sincronizan entre
-  sí -- es una decisión, no un descuido (ver "Despliegues activos"
-  arriba), pero implica que un análisis histórico completo requiere
-  consultar ambos por separado.
+- La base local de Docker corre **sin autenticación**, atada a
+  `127.0.0.1` -- suficiente para un equipo de un solo usuario, pero
+  habría que agregar credenciales antes de exponerla a la red.
+- Las bases de las dos máquinas (Pi / escritorio) no se sincronizan
+  entre sí -- es una decisión, no un descuido (ver "Despliegues
+  activos"), pero implica que un análisis histórico completo requiere
+  consultar ambas por separado.
+- Si se vuelve a usar Atlas: la IP pública de cada máquina es dinámica y
+  su Network Access requiere reautorizarse a mano cada vez que cambia
+  (fue la causa raíz de varias caídas de conexión antes de migrar a
+  local).
