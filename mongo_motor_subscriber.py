@@ -148,7 +148,7 @@ class MongoBatchWriter:
         self._stop = threading.Event()
 
         self.client.admin.command("ping")
-        log.info("Conectado a MongoDB Atlas (%s.[%s, %s]).", db, telemetria_col, eventos_col)
+        log.info("Conectado a MongoDB (%s.[%s, %s]).", db, telemetria_col, eventos_col)
 
     def add(self, coleccion: str, doc: Dict[str, Any]) -> None:
         if coleccion == "control_eventos":
